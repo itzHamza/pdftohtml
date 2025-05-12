@@ -1,36 +1,21 @@
 FROM ubuntu:22.04
 
-# Update and install dependencies
+# تحديث الحزم
 RUN apt-get update && apt-get install -y \
-    wget \
-    build-essential \
-    cmake \
-    libfreetype6-dev \
-    libpng-dev \
-    libjpeg-dev \
-    python3 \
-    python3-pip \
-    pkg-config \
-    git \
-    poppler-utils \
-    software-properties-common \
-    libfontconfig1-dev \
-    libfontforge-dev \
-    poppler-data
+    python3 python3-pip \
+    git cmake g++ pkg-config \
+    poppler-utils libfontforge-dev \
+    wget curl zip unzip \
+    make fontforge
 
-# Install pdf2htmlEX directly
-RUN apt-get install -y pdf2htmlex
+# تثبيت pdf2htmlEX
+RUN git clone https://github.com/pdf2htmlEX/pdf2htmlEX.git && \
+    cd pdf2htmlEX && cmake . && make && make install && cd .. && rm -rf pdf2htmlEX
 
-# Install Flask and other Python dependencies
-COPY requirements.txt /app/requirements.txt
+# نسخ الكود
 WORKDIR /app
-RUN pip3 install --no-cache-dir -r requirements.txt
+COPY . .
+RUN pip3 install -r requirements.txt
 
-# Copy the application code
-COPY *.py /app/
-
-# Expose the port the app runs on
-EXPOSE 8080
-
-# Command to run the application
-CMD ["python3", "app.py"]
+EXPOSE 8000
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
