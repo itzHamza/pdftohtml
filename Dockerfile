@@ -9,4 +9,7 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["python", "main.py"]
+# Set environment variable with default value
+ENV PORT=8080
+
+CMD ["gunicorn", "--bind", "0.0.0.0:${PORT}", "main:app"]
