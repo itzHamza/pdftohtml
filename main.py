@@ -1,224 +1,209 @@
-from flask import Flask, request, jsonify
-import fitz  # PyMuPDF
-import base64
-import io
-from PIL import Image
-import re
-import uuid
-import os
-import traceback
+from flask import Flask, request, send_file, jsonify, Response
 from flask_cors import CORS
+import requests
+import os
+import subprocess
+import tempfile
+import uuid
+import logging
+from werkzeug.utils import secure_filename
+import shutil
+import urllib.parse
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Add logging
-import logging
-logging.basicConfig(level=logging.DEBUG)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def sanitize_text(text):
-    """Clean up text extracted from PDF"""
-    # Remove excessive whitespace
-    text = re.sub(r'\s+', ' ', text)
-    # Escape HTML special characters
-    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    return text.strip()
+# Create temporary directory for storing files
+TEMP_DIR = os.path.join(tempfile.gettempdir(), 'pdf2html_temp')
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-def get_image_data_url(pixmap):
-    """Convert pixmap to base64 data URL"""
+def download_pdf(url):
+    """Download a PDF file from a URL and save it to a temporary file"""
+    logger.info(f"Downloading PDF from URL: {url}")
     try:
-        # Determine format based on pixmap characteristics
-        img_format = "jpeg" if pixmap.n >= 3 else "png"
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
         
-        # Convert pixmap to PIL Image
-        # For RGB images
-        if pixmap.n >= 3:
-            pil_img = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-        # For grayscale images
-        else:
-            pil_img = Image.frombytes("L", [pixmap.width, pixmap.height], pixmap.samples)
+        # Extract filename from URL or use a random name
+        filename = os.path.basename(urllib.parse.urlparse(url).path) or f"{uuid.uuid4()}.pdf"
+        filename = secure_filename(filename)
+        if not filename.lower().endswith('.pdf'):
+            filename += '.pdf'
+            
+        filepath = os.path.join(TEMP_DIR, filename)
         
-        # Save to bytes buffer
-        buffer = io.BytesIO()
-        pil_img.save(buffer, format=img_format.upper())
-        img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        
-        # Return as data URL
-        return f"data:image/{img_format};base64,{img_str}"
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                
+        logger.info(f"PDF downloaded successfully to {filepath}")
+        return filepath
     except Exception as e:
-        app.logger.error(f"Error processing image: {str(e)}")
-        app.logger.error(traceback.format_exc())
-        return ""  # Return empty string on error instead of breaking the whole process
+        logger.error(f"Error downloading PDF: {str(e)}")
+        raise
 
-def pdf_to_html(pdf_data):
-    """Convert PDF data to HTML with text and embedded images"""
-    # Open the PDF from binary data
-    doc = fitz.open(stream=pdf_data, filetype="pdf")
+def convert_pdf_to_html(pdf_path):
+    """Convert PDF to HTML using pdf2htmlEX"""
+    logger.info(f"Converting PDF to HTML: {pdf_path}")
     
-    html_parts = ['<!DOCTYPE html><html><head><meta charset="UTF-8">',
-                  '<style>',
-                  '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; background: white; }',
-                  '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; user-select: text; -webkit-user-select: text; }',
-                  '.pdf-text { position: absolute; white-space: nowrap; user-select: text; -webkit-user-select: text; cursor: text; }',
-                  '.pdf-image { position: absolute; }',
-                  'body { user-select: text; -webkit-user-select: text; }',
-                  '</style>',
-                  '</head><body>']
+    # Create a unique output directory
+    output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Process each page
-    for page_num, page in enumerate(doc):
-        try:
-            app.logger.info(f"Processing page {page_num+1}/{len(doc)}")
-            width, height = page.rect.width, page.rect.height
-            
-            # Start a new page div
-            html_parts.append(f'<div class="pdf-page" style="width:{width}px;height:{height}px;">')
-            
-            # Extract text with positions
-            text_blocks = page.get_text("dict")["blocks"]
-            html_parts.append('<div class="text-layer">')
-            
-            # Process text blocks
-            for block in text_blocks:
-                if block["type"] == 0:  # Text block
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            text = sanitize_text(span["text"])
-                            if not text:
-                                continue
-                                
-                            # Get text position and styling
-                            x0, y0 = span["origin"]
-                            font_size = span["size"]
-                            
-                            # Check if color is a tuple/list or an integer
-                            if isinstance(span["color"], (list, tuple)):
-                                font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
-                            else:
-                                # Handle the case where color is an int (single value)
-                                color_val = span["color"]
-                                font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
-                            
-                            # Add text with positioning and ensure text is selectable
-                            html_parts.append(
-                                f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
-                                f'font-size:{font_size}px;color:{font_color};">{text}</div>'
-                            )
-                            
-            html_parts.append('</div>')  # Close text layer
-            
-            # Extract and embed images - FIXED to handle image processing errors
-            try:
-                images = page.get_images(full=True)
-                for img_index, img_info in enumerate(images):
-                    try:
-                        # Properly handle the img_info tuple unpacking
-                        if not img_info or len(img_info) < 3:
-                            app.logger.warning(f"Skipping invalid image info on page {page_num+1}: {img_info}")
-                            continue
-                            
-                        # Unpack with proper indexing - this is where the error was likely happening
-                        # img_info format varies between PyMuPDF versions
-                        xref = img_info[0] if isinstance(img_info[0], int) else img_info[1]
-                        
-                        # Get the base image
-                        try:
-                            base_img = doc.extract_image(xref)
-                            pixmap = fitz.Pixmap(doc, xref)
-                        except Exception as e:
-                            app.logger.error(f"Error extracting image {xref}: {str(e)}")
-                            continue
-                        
-                        # Skip problem images
-                        if pixmap.width == 0 or pixmap.height == 0:
-                            app.logger.warning(f"Skipping zero-sized image on page {page_num+1}")
-                            continue
-                        
-                        # Try to find image position - just use a default if we can't find it
-                        x0, y0, x1, y1 = 0, 0, pixmap.width, pixmap.height
-                        for img_block in text_blocks:
-                            if img_block.get("type") == 1:  # Image block
-                                bbox = img_block.get("bbox")
-                                if bbox:
-                                    x0, y0, x1, y1 = bbox
-                        
-                        # Convert image to data URL
-                        data_url = get_image_data_url(pixmap)
-                        if data_url:  # Only add if we got a valid data URL
-                            # Add image with positioning
-                            html_parts.append(
-                                f'<img class="pdf-image" src="{data_url}" style="'
-                                f'left:{x0}px;top:{y0}px;width:{x1-x0}px;height:{y1-y0}px;">'
-                            )
-                    except Exception as e:
-                        app.logger.error(f"Error processing image {img_index} on page {page_num+1}: {str(e)}")
-                        app.logger.error(traceback.format_exc())
-                        continue
-            except Exception as e:
-                app.logger.error(f"Error extracting images from page {page_num+1}: {str(e)}")
-                app.logger.error(traceback.format_exc())
-            
-            html_parts.append('</div>')  # Close page div
-        except Exception as e:
-            app.logger.error(f"Error processing page {page_num+1}: {str(e)}")
-            app.logger.error(traceback.format_exc())
-            # Add an error message in the HTML
-            html_parts.append(f'<div class="error-page">Error rendering page {page_num+1}: {str(e)}</div>')
+    filename = os.path.basename(pdf_path)
+    output_filename = os.path.splitext(filename)[0] + '.html'
+    output_path = os.path.join(output_dir, output_filename)
     
-    html_parts.append('</body></html>')
-    return ''.join(html_parts)
+    try:
+        # pdf2htmlEX command with options to preserve text selection
+        cmd = [
+            'pdf2htmlEX',
+            '--zoom', '1.3',  # Scale factor
+            '--fit-width', '1024',  # Target page width
+            '--process-outline', '0',  # Skip outline processing for speed
+            '--dest-dir', output_dir,  # Output directory
+            '--optimize-text', '1',  # Optimize text for selection
+            '--font-format', 'woff',  # Use WOFF format for fonts
+            '--data-dir', output_dir,  # Directory for data files
+            '--split-pages', '0',  # Don't split pages into separate files
+            '--embed', 'cfijo',  # Embed: css,fonts,images,javascript,outline
+            pdf_path,
+            output_filename
+        ]
+        
+        logger.info(f"Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logger.error(f"pdf2htmlEX error: {result.stderr}")
+            raise Exception(f"PDF conversion failed: {result.stderr}")
+        
+        logger.info(f"PDF successfully converted to HTML: {output_path}")
+        
+        # Read the HTML file
+        with open(output_path, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        
+        # Clean up the temporary files but keep the output for a while
+        # (We'll clean it later with a scheduled task)
+        
+        return html_content, output_path
+    except Exception as e:
+        logger.error(f"Error converting PDF to HTML: {str(e)}")
+        # Clean up on failure
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+@app.route('/convert-url', methods=['POST'])
+def convert_url():
+    """Convert PDF from URL to HTML"""
+    try:
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'error': 'No URL provided'}), 400
+        
+        url = data['url']
+        pdf_path = download_pdf(url)
+        html_content, _ = convert_pdf_to_html(pdf_path)
+        
+        # Clean up the PDF file
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        
+        return Response(html_content, mimetype='text/html')
+    except Exception as e:
+        logger.exception("Error in convert-url endpoint")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/convert', methods=['POST'])
-def convert():
+def convert_file():
+    """Convert uploaded PDF file to HTML"""
     try:
-        app.logger.info(f"Received conversion request. Content-Type: {request.content_type}")
-        
-        # Check if request includes file
-        if 'file' not in request.files:
-            app.logger.info("No file in request, trying to read raw data")
+        if 'file' in request.files:
+            # Handle multipart/form-data upload
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+            
+            filename = secure_filename(file.filename)
+            pdf_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}_{filename}")
+            file.save(pdf_path)
+            
+        elif request.content_type == 'application/pdf':
+            # Handle direct binary upload
             pdf_data = request.data
             if not pdf_data:
-                app.logger.error("No PDF data provided")
-                return jsonify({'error': 'No PDF data provided'}), 400
-            app.logger.info(f"Read {len(pdf_data)} bytes of raw PDF data")
+                return jsonify({'error': 'No PDF data received'}), 400
+            
+            pdf_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.pdf")
+            with open(pdf_path, 'wb') as f:
+                f.write(pdf_data)
         else:
-            app.logger.info("File found in request")
-            pdf_file = request.files['file']
-            pdf_data = pdf_file.read()
-            app.logger.info(f"Read {len(pdf_data)} bytes from uploaded file")
+            return jsonify({'error': 'Invalid request format'}), 400
         
-        # Validate PDF data (basic check)
-        if len(pdf_data) < 4:
-            app.logger.error(f"PDF data too small: {len(pdf_data)} bytes")
-            return jsonify({'error': 'PDF data too small'}), 400
-            
-        # Check for PDF signature - be more lenient as some valid PDFs might not start with %PDF
-        if not pdf_data[:4].startswith(b'%PDF') and not pdf_data[:4].startswith(b'\x25PDF'):
-            app.logger.warning(f"PDF signature not found, but continuing anyway")
-            
-        try:
-            # Convert PDF to HTML
-            html_content = pdf_to_html(pdf_data)
-            app.logger.info(f"Conversion successful, generated {len(html_content)} bytes of HTML")
-            return html_content, 200, {'Content-Type': 'text/html'}
-        except Exception as e:
-            app.logger.error(f"Error in pdf_to_html: {str(e)}")
-            app.logger.error(traceback.format_exc())
-            return jsonify({'error': f'PDF conversion error: {str(e)}'}), 500
+        html_content, _ = convert_pdf_to_html(pdf_path)
+        
+        # Clean up the PDF file
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        
+        return Response(html_content, mimetype='text/html')
     except Exception as e:
-        app.logger.error(f"Unexpected error: {str(e)}")
-        app.logger.error(traceback.format_exc())
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        logger.exception("Error in convert endpoint")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    version_info = {
-        'pymupdf_version': fitz.version[0],
-        'flask_version': Flask.__version__,
-        'python_version': os.sys.version
-    }
-    return jsonify({'status': 'ok', 'versions': version_info}), 200
+# Cleanup task
+@app.before_first_request
+def setup_cleanup():
+    """Set up a background task to clean up old temporary files"""
+    def cleanup_old_files():
+        import threading
+        import time
+        
+        def run_cleanup():
+            while True:
+                logger.info("Running cleanup task")
+                try:
+                    # Remove files older than 1 hour
+                    now = time.time()
+                    for root, dirs, files in os.walk(TEMP_DIR):
+                        for f in files:
+                            filepath = os.path.join(root, f)
+                            if os.path.isfile(filepath):
+                                if os.stat(filepath).st_mtime < now - 3600:  # 1 hour
+                                    try:
+                                        os.remove(filepath)
+                                        logger.info(f"Removed old file: {filepath}")
+                                    except Exception as e:
+                                        logger.error(f"Error removing file {filepath}: {str(e)}")
+                        
+                        # Also clean up empty directories
+                        for d in dirs:
+                            dirpath = os.path.join(root, d)
+                            if not os.listdir(dirpath):  # Check if directory is empty
+                                try:
+                                    os.rmdir(dirpath)
+                                    logger.info(f"Removed empty directory: {dirpath}")
+                                except Exception as e:
+                                    logger.error(f"Error removing directory {dirpath}: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Error in cleanup task: {str(e)}")
+                
+                # Sleep for 30 minutes before next cleanup
+                time.sleep(1800)
+        
+        # Start the cleanup thread
+        cleanup_thread = threading.Thread(target=run_cleanup, daemon=True)
+        cleanup_thread.start()
+    
+    # Run the setup
+    cleanup_old_files()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))  # Default to 8080 if PORT not set
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Create gunicorn compatible entry point
+    app.run(host='0.0.0.0', port=3001, debug=True)
