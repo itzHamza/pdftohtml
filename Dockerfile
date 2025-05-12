@@ -4,9 +4,10 @@ FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y \
     python3 python3-pip \
     git cmake g++ pkg-config \
-    poppler-utils libfontforge-dev \
+    poppler-utils \
     wget curl zip unzip \
     make fontforge
+
 
 # تثبيت pdf2htmlEX
 RUN git clone https://github.com/pdf2htmlEX/pdf2htmlEX.git && \
