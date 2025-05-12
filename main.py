@@ -24,18 +24,19 @@ def sanitize_text(text):
     text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     return text.strip()
 
-def get_image_data_url(img):
-    """Convert image to base64 data URL"""
+def get_image_data_url(pixmap):
+    """Convert pixmap to base64 data URL"""
     try:
-        # Get image format (default to PNG if unknown)
-        img_format = img["colorspace"].name if hasattr(img, "colorspace") and img["colorspace"] else "png"
-        if img_format.lower() not in ["rgb", "cmyk", "gray"]:
-            img_format = "png"
-        else:
-            img_format = "jpeg" if img_format.lower() in ["rgb", "cmyk"] else "png"
+        # Determine format based on pixmap characteristics
+        img_format = "jpeg" if pixmap.n >= 3 else "png"
         
         # Convert pixmap to PIL Image
-        pil_img = Image.frombytes("RGB", [img.width, img.height], img.samples)
+        # For RGB images
+        if pixmap.n >= 3:
+            pil_img = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+        # For grayscale images
+        else:
+            pil_img = Image.frombytes("L", [pixmap.width, pixmap.height], pixmap.samples)
         
         # Save to bytes buffer
         buffer = io.BytesIO()
@@ -46,6 +47,7 @@ def get_image_data_url(img):
         return f"data:image/{img_format};base64,{img_str}"
     except Exception as e:
         app.logger.error(f"Error processing image: {str(e)}")
+        app.logger.error(traceback.format_exc())
         return ""  # Return empty string on error instead of breaking the whole process
 
 def pdf_to_html(pdf_data):
@@ -55,7 +57,7 @@ def pdf_to_html(pdf_data):
     
     html_parts = ['<!DOCTYPE html><html><head><meta charset="UTF-8">',
                   '<style>',
-                  '.pdf-page { position: relative; margin-bottom: 20px; }',
+                  '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; }',
                   '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }',
                   '.pdf-text { position: absolute; line-height: 1.2; }',
                   '.pdf-image { position: absolute; }',
@@ -64,76 +66,96 @@ def pdf_to_html(pdf_data):
     
     # Process each page
     for page_num, page in enumerate(doc):
-        width, height = page.rect.width, page.rect.height
-        
-        # Start a new page div
-        html_parts.append(f'<div class="pdf-page" style="width:{width}px;height:{height}px;">')
-        
-        # Extract text with positions
-        text_blocks = page.get_text("dict")["blocks"]
-        html_parts.append('<div class="text-layer">')
-        
-        # Process text blocks
-        for block in text_blocks:
-            if block["type"] == 0:  # Text block
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        text = sanitize_text(span["text"])
-                        if not text:
+        try:
+            app.logger.info(f"Processing page {page_num+1}/{len(doc)}")
+            width, height = page.rect.width, page.rect.height
+            
+            # Start a new page div
+            html_parts.append(f'<div class="pdf-page" style="width:{width}px;height:{height}px;">')
+            
+            # Extract text with positions
+            text_blocks = page.get_text("dict")["blocks"]
+            html_parts.append('<div class="text-layer">')
+            
+            # Process text blocks
+            for block in text_blocks:
+                if block["type"] == 0:  # Text block
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = sanitize_text(span["text"])
+                            if not text:
+                                continue
+                                
+                            # Get text position and styling
+                            x0, y0 = span["origin"]
+                            font_size = span["size"]
+                            font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
+                            
+                            # Add text with positioning
+                            html_parts.append(
+                                f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
+                                f'font-size:{font_size}px;color:{font_color};">{text}</div>'
+                            )
+                            
+            html_parts.append('</div>')  # Close text layer
+            
+            # Extract and embed images - FIXED to handle image processing errors
+            try:
+                images = page.get_images(full=True)
+                for img_index, img_info in enumerate(images):
+                    try:
+                        # Properly handle the img_info tuple unpacking
+                        if not img_info or len(img_info) < 3:
+                            app.logger.warning(f"Skipping invalid image info on page {page_num+1}: {img_info}")
                             continue
                             
-                        # Get text position and styling
-                        x0, y0 = span["origin"]
-                        font_size = span["size"]
-                        font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
+                        # Unpack with proper indexing - this is where the error was likely happening
+                        # img_info format varies between PyMuPDF versions
+                        xref = img_info[0] if isinstance(img_info[0], int) else img_info[1]
                         
-                        # Add text with positioning
-                        html_parts.append(
-                            f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
-                            f'font-size:{font_size}px;color:{font_color};">{text}</div>'
-                        )
+                        # Get the base image
+                        try:
+                            base_img = doc.extract_image(xref)
+                            pixmap = fitz.Pixmap(doc, xref)
+                        except Exception as e:
+                            app.logger.error(f"Error extracting image {xref}: {str(e)}")
+                            continue
                         
-        html_parts.append('</div>')  # Close text layer
-        
-        # Extract and embed images
-        try:
-            images = page.get_images(full=True)
-            for img_index, img_info in enumerate(images):
-                try:
-                    img_index, xref, smask, *_ = img_info
-                    
-                    # Get the base image
-                    base_img = doc.extract_image(xref)
-                    pixmap = fitz.Pixmap(doc, xref)
-                    
-                    # If we have a mask, apply it
-                    if smask > 0:
-                        mask_img = fitz.Pixmap(doc, smask)
-                        pixmap = fitz.Pixmap(pixmap, mask_img)
-                    
-                    # Get the image position on the page
-                    for img_block in text_blocks:
-                        if img_block["type"] == 1:  # Image block
-                            bbox = img_block["bbox"]
-                            x0, y0, x1, y1 = bbox
-                            
-                            # Convert image to data URL
-                            data_url = get_image_data_url(pixmap)
-                            if data_url:  # Only add if we got a valid data URL
-                                # Add image with positioning
-                                html_parts.append(
-                                    f'<img class="pdf-image" src="{data_url}" style="'
-                                    f'left:{x0}px;top:{y0}px;width:{x1-x0}px;height:{y1-y0}px;">'
-                                )
-                except Exception as e:
-                    app.logger.error(f"Error processing image {img_index} on page {page_num}: {str(e)}")
-                    # Continue with the next image instead of breaking
-                    continue
+                        # Skip problem images
+                        if pixmap.width == 0 or pixmap.height == 0:
+                            app.logger.warning(f"Skipping zero-sized image on page {page_num+1}")
+                            continue
+                        
+                        # Try to find image position - just use a default if we can't find it
+                        x0, y0, x1, y1 = 0, 0, pixmap.width, pixmap.height
+                        for img_block in text_blocks:
+                            if img_block.get("type") == 1:  # Image block
+                                bbox = img_block.get("bbox")
+                                if bbox:
+                                    x0, y0, x1, y1 = bbox
+                        
+                        # Convert image to data URL
+                        data_url = get_image_data_url(pixmap)
+                        if data_url:  # Only add if we got a valid data URL
+                            # Add image with positioning
+                            html_parts.append(
+                                f'<img class="pdf-image" src="{data_url}" style="'
+                                f'left:{x0}px;top:{y0}px;width:{x1-x0}px;height:{y1-y0}px;">'
+                            )
+                    except Exception as e:
+                        app.logger.error(f"Error processing image {img_index} on page {page_num+1}: {str(e)}")
+                        app.logger.error(traceback.format_exc())
+                        continue
+            except Exception as e:
+                app.logger.error(f"Error extracting images from page {page_num+1}: {str(e)}")
+                app.logger.error(traceback.format_exc())
+            
+            html_parts.append('</div>')  # Close page div
         except Exception as e:
-            app.logger.error(f"Error extracting images from page {page_num}: {str(e)}")
-            # Continue with the next page
-        
-        html_parts.append('</div>')  # Close page div
+            app.logger.error(f"Error processing page {page_num+1}: {str(e)}")
+            app.logger.error(traceback.format_exc())
+            # Add an error message in the HTML
+            html_parts.append(f'<div class="error-page">Error rendering page {page_num+1}: {str(e)}</div>')
     
     html_parts.append('</body></html>')
     return ''.join(html_parts)
@@ -142,7 +164,6 @@ def pdf_to_html(pdf_data):
 def convert():
     try:
         app.logger.info(f"Received conversion request. Content-Type: {request.content_type}")
-        app.logger.info(f"Request headers: {request.headers}")
         
         # Check if request includes file
         if 'file' not in request.files:
@@ -158,10 +179,14 @@ def convert():
             pdf_data = pdf_file.read()
             app.logger.info(f"Read {len(pdf_data)} bytes from uploaded file")
         
-        # Validate PDF data
-        if len(pdf_data) < 4 or pdf_data[:4] != b'%PDF':
-            app.logger.error("Invalid PDF data - doesn't start with %PDF signature")
-            return jsonify({'error': 'Invalid PDF data'}), 400
+        # Validate PDF data (basic check)
+        if len(pdf_data) < 4:
+            app.logger.error(f"PDF data too small: {len(pdf_data)} bytes")
+            return jsonify({'error': 'PDF data too small'}), 400
+            
+        # Check for PDF signature - be more lenient as some valid PDFs might not start with %PDF
+        if not pdf_data[:4].startswith(b'%PDF') and not pdf_data[:4].startswith(b'\x25PDF'):
+            app.logger.warning(f"PDF signature not found, but continuing anyway")
             
         try:
             # Convert PDF to HTML
@@ -179,7 +204,12 @@ def convert():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'ok'}), 200
+    version_info = {
+        'pymupdf_version': fitz.version[0],
+        'flask_version': Flask.__version__,
+        'python_version': os.sys.version
+    }
+    return jsonify({'status': 'ok', 'versions': version_info}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))  # Default to 8080 if PORT not set
