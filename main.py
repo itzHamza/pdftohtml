@@ -143,5 +143,19 @@ def health_check():
     return jsonify({'status': 'ok'}), 200
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))  # Default to 8080 if PORT not set
+    # Explicitly print the port we're trying to use for debugging
+    port_env = os.environ.get('PORT')
+    print(f"PORT environment variable: {port_env}")
+    
+    # Try to convert to integer, with more robust error handling
+    try:
+        if port_env:
+            port = int(port_env)
+        else:
+            port = 8080
+    except ValueError:
+        print(f"Warning: Invalid PORT value '{port_env}', using default 8080")
+        port = 8080
+        
+    print(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port)
