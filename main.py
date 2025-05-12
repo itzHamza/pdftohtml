@@ -89,7 +89,14 @@ def pdf_to_html(pdf_data):
                             # Get text position and styling
                             x0, y0 = span["origin"]
                             font_size = span["size"]
-                            font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
+                            
+                            # Check if color is a tuple/list or an integer
+                            if isinstance(span["color"], (list, tuple)):
+                                font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
+                            else:
+                                # Handle the case where color is an int (single value)
+                                color_val = span["color"]
+                                font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
                             
                             # Add text with positioning
                             html_parts.append(
