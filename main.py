@@ -16,6 +16,8 @@ CORS(app)  # Enable CORS for all routes
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
+# Updated sections for main.py to fix text rendering issues
+
 def sanitize_text(text):
     """Clean up text extracted from PDF"""
     # Remove excessive whitespace
@@ -59,13 +61,14 @@ def pdf_to_html(pdf_data):
                   '<style>',
                   '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; background: white; }',
                   '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }',
-                  '.pdf-text { position: absolute; line-height: 1.2; }',
+                  # Updated PDF text styling - remove white-space:nowrap
+                  '.pdf-text { position: absolute; word-wrap: break-word; overflow: hidden; max-width: 100%; }',
                   '.pdf-image { position: absolute; }',
                   '</style>',
                   '</head><body>']
     
-    # Process each page
-    for page_num, page in enumerate(doc):
+    
+  for page_num, page in enumerate(doc):
         try:
             app.logger.info(f"Processing page {page_num+1}/{len(doc)}")
             width, height = page.rect.width, page.rect.height
@@ -88,6 +91,7 @@ def pdf_to_html(pdf_data):
                                 
                             # Get text position and styling
                             x0, y0 = span["origin"]
+                            width_estimate = span["size"] * len(text) * 0.6  # Estimate width based on font size
                             font_size = span["size"]
                             
                             # Check if color is a tuple/list or an integer
@@ -98,10 +102,14 @@ def pdf_to_html(pdf_data):
                                 color_val = span["color"]
                                 font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
                             
-                            # Add text with positioning
+                            # Calculate the width available from this position to the edge
+                            available_width = width - x0
+                            
+                            # Add text with positioning and estimated width constraint
                             html_parts.append(
                                 f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
-                                f'font-size:{font_size}px;color:{font_color};">{text}</div>'
+                                f'font-size:{font_size}px;color:{font_color};'
+                                f'max-width:{min(width_estimate, available_width)}px;">{text}</div>'
                             )
                             
             html_parts.append('</div>')  # Close text layer
@@ -164,8 +172,6 @@ def pdf_to_html(pdf_data):
             # Add an error message in the HTML
             html_parts.append(f'<div class="error-page">Error rendering page {page_num+1}: {str(e)}</div>')
     
-    html_parts.append('</body></html>')
-    return ''.join(html_parts)
 
 @app.route('/convert', methods=['POST'])
 def convert():
