@@ -59,7 +59,7 @@ def pdf_to_html(pdf_data):
                   '<style>',
                   '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; background: white; }',
                   '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }',
-                  '.pdf-text { position: absolute; line-height: 1.2; }',
+                  '.pdf-text { position: absolute; white-space: nowrap; }',
                   '.pdf-image { position: absolute; }',
                   '</style>',
                   '</head><body>']
