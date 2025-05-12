@@ -8,6 +8,7 @@ import uuid
 import os
 import traceback
 from flask_cors import CORS
+from collections import defaultdict
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -57,11 +58,13 @@ def pdf_to_html(pdf_data):
     
     html_parts = ['<!DOCTYPE html><html><head><meta charset="UTF-8">',
                   '<style>',
-                  '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; }',
+                  '* { box-sizing: border-box; }',
+                  'body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }',
+                  '.pdf-page { position: relative; margin-bottom: 30px; border: 1px solid #ddd; overflow: hidden; }',
                   '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }',
-                  '.pdf-text { position: absolute; line-height: 1.2; white-space: nowrap; overflow: visible; }',
-                  '.pdf-paragraph { position: absolute; margin: 0; padding: 0; }',
-                  '.pdf-image { position: absolute; }',
+                  '.pdf-line { position: relative; margin: 0; padding: 0; overflow: visible; white-space: pre-wrap; text-align: left; word-break: break-word; }',
+                  '.pdf-block { margin-bottom: 12px; }',
+                  '.pdf-image { position: absolute; z-index: 1; }',
                   '</style>',
                   '</head><body>']
     
@@ -74,85 +77,33 @@ def pdf_to_html(pdf_data):
             # Start a new page div
             html_parts.append(f'<div class="pdf-page" style="width:{width}px;height:{height}px;">')
             
-            # Extract text with positions
-            text_blocks = page.get_text("dict")["blocks"]
+            # Use HTML display mode which better preserves layout
             html_parts.append('<div class="text-layer">')
             
-            # Track processed line positions to prevent overlap
-            processed_lines = {}
+            # Get HTML - this is a more accurate representation with less overlapping
+            html_text = page.get_text("html")
             
-            # Process text blocks - now improved for better layout
-            for block_idx, block in enumerate(text_blocks):
-                if block["type"] == 0:  # Text block
-                    # Group spans by their vertical position to form proper lines
-                    lines_by_y = {}
-                    
-                    for line in block["lines"]:
-                        # Get line bounding box
-                        line_bbox = line.get("bbox", [0, 0, 0, 0])
-                        line_y = round(line_bbox[1])  # Round y position to group nearby lines
-                        
-                        if line_y not in lines_by_y:
-                            lines_by_y[line_y] = []
-                            
-                        for span in line["spans"]:
-                            lines_by_y[line_y].append(span)
-                    
-                    # Process each line
-                    for line_y, spans in sorted(lines_by_y.items()):
-                        # Check if this line position is already occupied
-                        line_key = f"{round(line_y)}"
-                        
-                        # Skip if too close to an existing line, or adjust position
-                        if line_key in processed_lines:
-                            # Adjust position to prevent overlap
-                            offset = 5  # Add 5px offset to prevent overlap
-                            new_y = line_y
-                            new_key = line_key
-                            
-                            while new_key in processed_lines:
-                                new_y += offset
-                                new_key = f"{round(new_y)}"
-                            
-                            line_y = new_y
-                            line_key = new_key
-                        
-                        processed_lines[line_key] = True
-                        
-                        # Sort spans by x position
-                        spans.sort(key=lambda span: span["origin"][0])
-                        
-                        # Create a paragraph for the entire line
-                        line_x = spans[0]["origin"][0]
-                        line_text_parts = []
-                        font_size = spans[0]["size"]
-                        
-                        # Collect all text in the line
-                        for span in spans:
-                            text = sanitize_text(span["text"])
-                            if text:
-                                line_text_parts.append(text)
-                        
-                        # Only add non-empty lines
-                        if line_text_parts:
-                            line_text = " ".join(line_text_parts)
-                            
-                            # Determine text color (use first span's color)
-                            if isinstance(spans[0]["color"], (list, tuple)):
-                                font_color = f"#{spans[0]['color'][0]:02x}{spans[0]['color'][1]:02x}{spans[0]['color'][2]:02x}"
-                            else:
-                                color_val = spans[0]["color"]
-                                font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
-                            
-                            # Add text with positioning as a paragraph
-                            html_parts.append(
-                                f'<p class="pdf-paragraph" style="left:{line_x}px;top:{line_y}px;'
-                                f'font-size:{font_size}px;color:{font_color};">{line_text}</p>'
-                            )
+            # Basic cleanup of the HTML to match our styling
+            # Replace default CSS classes with our own
+            html_text = html_text.replace('<p ', '<p class="pdf-line" ')
+            html_text = html_text.replace('<div ', '<div class="pdf-block" ')
+            
+            # Remove potentially problematic styles that could cause overlapping
+            html_text = re.sub(r'position:\s*absolute;', '', html_text)
+            html_text = re.sub(r'top:\s*[\d.]+px;', '', html_text)
+            html_text = re.sub(r'left:\s*[\d.]+px;', '', html_text)
+            
+            # Extract just the body content
+            match = re.search(r'<body[^>]*>(.*?)</body>', html_text, re.DOTALL)
+            if match:
+                html_text = match.group(1)
+            
+            # Add the cleaned HTML to our output
+            html_parts.append(html_text)
             
             html_parts.append('</div>')  # Close text layer
             
-            # Extract and embed images - FIXED to handle image processing errors
+            # Extract and embed images
             try:
                 images = page.get_images(full=True)
                 for img_index, img_info in enumerate(images):
@@ -162,13 +113,11 @@ def pdf_to_html(pdf_data):
                             app.logger.warning(f"Skipping invalid image info on page {page_num+1}: {img_info}")
                             continue
                             
-                        # Unpack with proper indexing - this is where the error was likely happening
-                        # img_info format varies between PyMuPDF versions
+                        # Unpack with proper indexing
                         xref = img_info[0] if isinstance(img_info[0], int) else img_info[1]
                         
                         # Get the base image
                         try:
-                            base_img = doc.extract_image(xref)
                             pixmap = fitz.Pixmap(doc, xref)
                         except Exception as e:
                             app.logger.error(f"Error extracting image {xref}: {str(e)}")
@@ -179,13 +128,30 @@ def pdf_to_html(pdf_data):
                             app.logger.warning(f"Skipping zero-sized image on page {page_num+1}")
                             continue
                         
-                        # Try to find image position - just use a default if we can't find it
-                        x0, y0, x1, y1 = 0, 0, pixmap.width, pixmap.height
-                        for img_block in text_blocks:
-                            if img_block.get("type") == 1:  # Image block
-                                bbox = img_block.get("bbox")
-                                if bbox:
-                                    x0, y0, x1, y1 = bbox
+                        # Find image position from page
+                        image_rect = None
+                        image_found = False
+                        
+                        # Try to find the image on the page
+                        for img_obj in page.get_images(full=False):
+                            if img_obj[0] == xref:
+                                # Find all instances of this image on the page
+                                rects = page.get_image_rects(img_obj)
+                                if rects:
+                                    image_rect = rects[0]  # Use first instance
+                                    image_found = True
+                                    break
+                        
+                        if not image_found:
+                            app.logger.warning(f"Could not find position for image {xref} on page {page_num+1}")
+                            continue
+                            
+                        if image_rect:
+                            x0, y0, x1, y1 = image_rect
+                        else:
+                            # Fallback - place at origin with natural size
+                            x0, y0 = 0, 0
+                            x1, y1 = pixmap.width, pixmap.height
                         
                         # Convert image to data URL
                         data_url = get_image_data_url(pixmap)
