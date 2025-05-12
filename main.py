@@ -50,12 +50,6 @@ def get_image_data_url(pixmap):
         app.logger.error(traceback.format_exc())
         return ""  # Return empty string on error instead of breaking the whole process
 
-def calculate_text_width(text, font_size):
-    """Calculate approximate width of text based on font size"""
-    # This is a rough estimation - average character width is about 0.6 times the font size
-    char_width_factor = 0.6
-    return len(text) * font_size * char_width_factor
-
 def pdf_to_html(pdf_data):
     """Convert PDF data to HTML with text and embedded images"""
     # Open the PDF from binary data
@@ -63,11 +57,10 @@ def pdf_to_html(pdf_data):
     
     html_parts = ['<!DOCTYPE html><html><head><meta charset="UTF-8">',
                   '<style>',
-                  '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; background: white; overflow: hidden; }',
-                  '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; overflow: hidden; }',
-                  # Updated styling for text elements - remove white-space: nowrap and add word wrapping
-                  '.pdf-text { position: absolute; word-wrap: break-word; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }',
-                  '.pdf-image { position: absolute; object-fit: contain; }',
+                  '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; background: white; }',
+                  '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }',
+                  '.pdf-text { position: absolute; line-height: 1.2; }',
+                  '.pdf-image { position: absolute; }',
                   '</style>',
                   '</head><body>']
     
@@ -97,9 +90,6 @@ def pdf_to_html(pdf_data):
                             x0, y0 = span["origin"]
                             font_size = span["size"]
                             
-                            # Calculate approximate text width
-                            text_width = calculate_text_width(text, font_size)
-                            
                             # Check if color is a tuple/list or an integer
                             if isinstance(span["color"], (list, tuple)):
                                 font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
@@ -108,21 +98,15 @@ def pdf_to_html(pdf_data):
                                 color_val = span["color"]
                                 font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
                             
-                            # Calculate the available width from this position to the page edge
-                            available_width = width - x0 - 10  # 10px safety margin
-                            # Use the smaller of calculated width or available width
-                            max_width = min(text_width, available_width)
-                            
-                            # Add text with better positioning and width constraint
+                            # Add text with positioning
                             html_parts.append(
                                 f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
-                                f'font-size:{font_size}px;color:{font_color};'
-                                f'max-width:{max_width}px;line-height:1.2;letter-spacing:normal;">{text}</div>'
+                                f'font-size:{font_size}px;color:{font_color};">{text}</div>'
                             )
                             
             html_parts.append('</div>')  # Close text layer
             
-            # Extract and embed images
+            # Extract and embed images - FIXED to handle image processing errors
             try:
                 images = page.get_images(full=True)
                 for img_index, img_info in enumerate(images):
