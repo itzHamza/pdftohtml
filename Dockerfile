@@ -1,18 +1,36 @@
-# Use lightweight Python base image
-FROM python:3.11-slim
+FROM ubuntu:22.04
 
-# Set working directory
+# Update and install dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    build-essential \
+    cmake \
+    libfreetype6-dev \
+    libpng-dev \
+    libjpeg-dev \
+    python3 \
+    python3-pip \
+    pkg-config \
+    git \
+    poppler-utils \
+    software-properties-common \
+    libfontconfig1-dev \
+    libfontforge-dev \
+    poppler-data
+
+# Install pdf2htmlEX directly
+RUN apt-get install -y pdf2htmlex
+
+# Install Flask and other Python dependencies
+COPY requirements.txt /app/requirements.txt
 WORKDIR /app
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy dependency list and install
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy the application code
+COPY *.py /app/
 
-# Copy application code
-COPY . .
-
-# Expose default port (Railway will override it via $PORT)
+# Expose the port the app runs on
 EXPOSE 8080
 
-# Run the application with Gunicorn
-CMD gunicorn --bind 0.0.0.0:8080 main:app
+# Command to run the application
+CMD ["python3", "app.py"]
