@@ -8,7 +8,6 @@ import uuid
 import os
 import traceback
 from flask_cors import CORS
-from collections import defaultdict
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -58,13 +57,10 @@ def pdf_to_html(pdf_data):
     
     html_parts = ['<!DOCTYPE html><html><head><meta charset="UTF-8">',
                   '<style>',
-                  '* { box-sizing: border-box; }',
-                  'body { margin: 0; padding: 20px; font-family: Arial, sans-serif; }',
-                  '.pdf-page { position: relative; margin-bottom: 30px; border: 1px solid #ddd; overflow: hidden; }',
+                  '.pdf-page { position: relative; margin-bottom: 20px; border: 1px solid #ddd; background: white; }',
                   '.text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }',
-                  '.pdf-line { position: relative; margin: 0; padding: 0; overflow: visible; white-space: pre-wrap; text-align: left; word-break: break-word; }',
-                  '.pdf-block { margin-bottom: 12px; }',
-                  '.pdf-image { position: absolute; z-index: 1; }',
+                  '.pdf-text { position: absolute; line-height: 1.2; }',
+                  '.pdf-image { position: absolute; }',
                   '</style>',
                   '</head><body>']
     
@@ -77,33 +73,40 @@ def pdf_to_html(pdf_data):
             # Start a new page div
             html_parts.append(f'<div class="pdf-page" style="width:{width}px;height:{height}px;">')
             
-            # Use HTML display mode which better preserves layout
+            # Extract text with positions
+            text_blocks = page.get_text("dict")["blocks"]
             html_parts.append('<div class="text-layer">')
             
-            # Get HTML - this is a more accurate representation with less overlapping
-            html_text = page.get_text("html")
-            
-            # Basic cleanup of the HTML to match our styling
-            # Replace default CSS classes with our own
-            html_text = html_text.replace('<p ', '<p class="pdf-line" ')
-            html_text = html_text.replace('<div ', '<div class="pdf-block" ')
-            
-            # Remove potentially problematic styles that could cause overlapping
-            html_text = re.sub(r'position:\s*absolute;', '', html_text)
-            html_text = re.sub(r'top:\s*[\d.]+px;', '', html_text)
-            html_text = re.sub(r'left:\s*[\d.]+px;', '', html_text)
-            
-            # Extract just the body content
-            match = re.search(r'<body[^>]*>(.*?)</body>', html_text, re.DOTALL)
-            if match:
-                html_text = match.group(1)
-            
-            # Add the cleaned HTML to our output
-            html_parts.append(html_text)
-            
+            # Process text blocks
+            for block in text_blocks:
+                if block["type"] == 0:  # Text block
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = sanitize_text(span["text"])
+                            if not text:
+                                continue
+                                
+                            # Get text position and styling
+                            x0, y0 = span["origin"]
+                            font_size = span["size"]
+                            
+                            # Check if color is a tuple/list or an integer
+                            if isinstance(span["color"], (list, tuple)):
+                                font_color = f"#{span['color'][0]:02x}{span['color'][1]:02x}{span['color'][2]:02x}"
+                            else:
+                                # Handle the case where color is an int (single value)
+                                color_val = span["color"]
+                                font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
+                            
+                            # Add text with positioning
+                            html_parts.append(
+                                f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
+                                f'font-size:{font_size}px;color:{font_color};">{text}</div>'
+                            )
+                            
             html_parts.append('</div>')  # Close text layer
             
-            # Extract and embed images
+            # Extract and embed images - FIXED to handle image processing errors
             try:
                 images = page.get_images(full=True)
                 for img_index, img_info in enumerate(images):
@@ -113,11 +116,13 @@ def pdf_to_html(pdf_data):
                             app.logger.warning(f"Skipping invalid image info on page {page_num+1}: {img_info}")
                             continue
                             
-                        # Unpack with proper indexing
+                        # Unpack with proper indexing - this is where the error was likely happening
+                        # img_info format varies between PyMuPDF versions
                         xref = img_info[0] if isinstance(img_info[0], int) else img_info[1]
                         
                         # Get the base image
                         try:
+                            base_img = doc.extract_image(xref)
                             pixmap = fitz.Pixmap(doc, xref)
                         except Exception as e:
                             app.logger.error(f"Error extracting image {xref}: {str(e)}")
@@ -128,30 +133,13 @@ def pdf_to_html(pdf_data):
                             app.logger.warning(f"Skipping zero-sized image on page {page_num+1}")
                             continue
                         
-                        # Find image position from page
-                        image_rect = None
-                        image_found = False
-                        
-                        # Try to find the image on the page
-                        for img_obj in page.get_images(full=False):
-                            if img_obj[0] == xref:
-                                # Find all instances of this image on the page
-                                rects = page.get_image_rects(img_obj)
-                                if rects:
-                                    image_rect = rects[0]  # Use first instance
-                                    image_found = True
-                                    break
-                        
-                        if not image_found:
-                            app.logger.warning(f"Could not find position for image {xref} on page {page_num+1}")
-                            continue
-                            
-                        if image_rect:
-                            x0, y0, x1, y1 = image_rect
-                        else:
-                            # Fallback - place at origin with natural size
-                            x0, y0 = 0, 0
-                            x1, y1 = pixmap.width, pixmap.height
+                        # Try to find image position - just use a default if we can't find it
+                        x0, y0, x1, y1 = 0, 0, pixmap.width, pixmap.height
+                        for img_block in text_blocks:
+                            if img_block.get("type") == 1:  # Image block
+                                bbox = img_block.get("bbox")
+                                if bbox:
+                                    x0, y0, x1, y1 = bbox
                         
                         # Convert image to data URL
                         data_url = get_image_data_url(pixmap)
