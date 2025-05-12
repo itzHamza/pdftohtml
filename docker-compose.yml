@@ -1,0 +1,13 @@
+version: '3'
+
+services:
+  pdf2html-converter:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/app
+    environment:
+      - PORT=8080
+      - DEBUG=True
+    restart: unless-stopped
