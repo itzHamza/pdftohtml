@@ -14,5 +14,5 @@ COPY . .
 # Expose default port (Railway will override it via $PORT)
 EXPOSE 8080
 
-# Run the Flask app using Python directly
-CMD ["python", "main.py"]
+# Run the application with Gunicorn
+CMD gunicorn --bind 0.0.0.0:8080 main:app
