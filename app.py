@@ -1,49 +1,76 @@
 #!/usr/bin/env python3
+from flask import Flask, request, send_file, jsonify, Response
+from flask_cors import CORS
+import requests
 import os
-import io
-import uuid
-import base64
+import subprocess
 import tempfile
+import uuid
 import logging
-from pathlib import Path
-from typing import Tuple, List, Dict, Any
+from werkzeug.utils import secure_filename
+import shutil
+import urllib.parse
 
-# PDF text extraction
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTChar, LTPage
+# Import the alternative converter
+import alternative_converter
 
-# PDF rendering to images
-from pdf2image import convert_from_path, convert_from_bytes
-from PIL import Image
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class AlternativePdfConverter:
-    """
-    Alternative PDF to HTML converter that uses pdfminer.six for text extraction
-    and pdf2image for visual representation when pdf2htmlEX is not available.
-    """
-    
-    def __init__(self, temp_dir=None):
-        """Initialize the converter with a temporary directory"""
-        self.temp_dir = temp_dir or tempfile.gettempdir()
+# Create temporary directory for storing files
+TEMP_DIR = os.path.join(tempfile.gettempdir(), 'pdf2html_temp')
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Check if we should use the alternative converter
+USE_ALTERNATIVE = os.environ.get('USE_ALTERNATIVE_CONVERTER', 'false').lower() == 'true'
+
+def download_pdf(url):
+    """Download a PDF file from a URL and save it to a temporary file"""
+    logger.info(f"Downloading PDF from URL: {url}")
+    try:
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
         
-    def convert_pdf_to_html(self, pdf_path: str) -> Tuple[str, str]:
-        """
-        Convert PDF to HTML with selectable text overlaid on page images
-        
-        Args:
-            pdf_path: Path to the PDF file
+        # Extract filename from URL or use a random name
+        filename = os.path.basename(urllib.parse.urlparse(url).path) or f"{uuid.uuid4()}.pdf"
+        filename = secure_filename(filename)
+        if not filename.lower().endswith('.pdf'):
+            filename += '.pdf'
             
-        Returns:
-            Tuple[str, str]: HTML content and output path
-        """
-        logger.info(f"Converting PDF to HTML using alternative method: {pdf_path}")
+        filepath = os.path.join(TEMP_DIR, filename)
         
-        # Create output directory
-        output_dir = os.path.join(self.temp_dir, str(uuid.uuid4()))
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                
+        logger.info(f"PDF downloaded successfully to {filepath}")
+        return filepath
+    except Exception as e:
+        logger.error(f"Error downloading PDF: {str(e)}")
+        raise
+
+def convert_pdf_to_html(pdf_path):
+    """Convert PDF to HTML using pdf2htmlEX or the alternative converter"""
+    logger.info(f"Converting PDF to HTML: {pdf_path}")
+    
+    if USE_ALTERNATIVE:
+        logger.info("Using alternative PDF converter")
+        try:
+            html_content, output_path = alternative_converter.convert_from_file(pdf_path)
+            return html_content, output_path
+        except Exception as e:
+            logger.error(f"Alternative conversion failed: {str(e)}")
+            raise Exception(f"PDF conversion failed: {str(e)}")
+    else:
+        # Use original pdf2htmlEX method
+        logger.info("Using pdf2htmlEX converter")
+        
+        # Create a unique output directory
+        output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
         os.makedirs(output_dir, exist_ok=True)
         
         filename = os.path.basename(pdf_path)
@@ -51,258 +78,151 @@ class AlternativePdfConverter:
         output_path = os.path.join(output_dir, output_filename)
         
         try:
-            # 1. Extract text and positions from PDF
-            page_texts = self._extract_text_with_positions(pdf_path)
+            # pdf2htmlEX command with options to preserve text selection
+            cmd = [
+                'pdf2htmlEX',
+                '--zoom', '1.3',  # Scale factor
+                '--fit-width', '1024',  # Target page width
+                '--process-outline', '0',  # Skip outline processing for speed
+                '--dest-dir', output_dir,  # Output directory
+                '--optimize-text', '1',  # Optimize text for selection
+                '--font-format', 'woff',  # Use WOFF format for fonts
+                '--data-dir', output_dir,  # Directory for data files
+                '--split-pages', '0',  # Don't split pages into separate files
+                '--embed', 'cfijo',  # Embed: css,fonts,images,javascript,outline
+                pdf_path,
+                output_filename
+            ]
             
-            # 2. Convert PDF pages to images
-            page_images = self._convert_pdf_to_images(pdf_path)
+            logger.info(f"Running command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
             
-            # 3. Generate HTML with text overlay on images
-            html_content = self._generate_html(page_texts, page_images)
-            
-            # Save the HTML file
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
+            if result.returncode != 0:
+                logger.error(f"pdf2htmlEX error: {result.stderr}")
                 
+                # If pdf2htmlEX fails, try the alternative method
+                logger.info("Falling back to alternative converter")
+                return alternative_converter.convert_from_file(pdf_path)
+            
             logger.info(f"PDF successfully converted to HTML: {output_path}")
+            
+            # Read the HTML file
+            with open(output_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            
             return html_content, output_path
-            
         except Exception as e:
-            logger.error(f"Error in alternative PDF conversion: {str(e)}")
-            raise
-    
-    def _extract_text_with_positions(self, pdf_path: str) -> List[Dict[str, Any]]:
-        """
-        Extract text and position information from each page of the PDF
-        
-        Args:
-            pdf_path: Path to the PDF file
+            logger.error(f"Error with pdf2htmlEX: {str(e)}")
             
-        Returns:
-            List of dictionaries with page text elements and their positions
-        """
-        logger.info("Extracting text with positions from PDF")
-        pages = []
-        
-        for page_layout in extract_pages(pdf_path):
-            page_number = page_layout.pageid
-            page_width = page_layout.width
-            page_height = page_layout.height
-            
-            text_elements = []
-            
-            # Extract text elements with their positions
-            for element in page_layout:
-                if isinstance(element, LTTextContainer):
-                    text = element.get_text().strip()
-                    if not text:
-                        continue
-                        
-                    # Get bounding box coordinates (x0, y0, x1, y1)
-                    x0, y0, x1, y1 = element.bbox
-                    
-                    # Convert PDF coordinates (origin at bottom-left) to HTML/image coordinates (origin at top-left)
-                    # and scale to percentage for responsive layout
-                    left = (x0 / page_width) * 100
-                    # Flip y-coordinate since PDF origin is bottom-left but HTML is top-left
-                    top = ((page_height - y1) / page_height) * 100
-                    width = ((x1 - x0) / page_width) * 100
-                    height = ((y1 - y0) / page_height) * 100
-                    
-                    # Get font information if available
-                    font_name = "Arial"
-                    font_size = 12
-                    
-                    for text_line in element:
-                        for char in text_line:
-                            if isinstance(char, LTChar):
-                                font_name = char.fontname
-                                font_size = char.size
-                                break
-                        if font_name != "Arial":
-                            break
-                    
-                    text_elements.append({
-                        'text': text,
-                        'left': left,
-                        'top': top,
-                        'width': width,
-                        'height': height,
-                        'font_name': font_name,
-                        'font_size': font_size
-                    })
-            
-            pages.append({
-                'page_number': page_number,
-                'width': page_width,
-                'height': page_height,
-                'text_elements': text_elements
-            })
-            
-        logger.info(f"Extracted text from {len(pages)} pages")
-        return pages
-    
-    def _convert_pdf_to_images(self, pdf_path: str) -> List[str]:
-        """
-        Convert PDF pages to base64-encoded image strings
-        
-        Args:
-            pdf_path: Path to the PDF file
-            
-        Returns:
-            List of base64-encoded image strings for each page
-        """
-        logger.info("Converting PDF pages to images")
-        
-        # Convert PDF to list of PIL Images with high DPI for better quality
-        images = convert_from_path(pdf_path, dpi=150)
-        
-        # Convert each image to base64-encoded string
-        base64_images = []
-        for i, img in enumerate(images):
-            image_io = io.BytesIO()
-            img.save(image_io, format='PNG')
-            encoded_image = base64.b64encode(image_io.getvalue()).decode('utf-8')
-            base64_images.append(f"data:image/png;base64,{encoded_image}")
-        
-        logger.info(f"Converted {len(base64_images)} PDF pages to images")
-        return base64_images
-    
-    def _generate_html(self, page_texts: List[Dict[str, Any]], page_images: List[str]) -> str:
-        """
-        Generate HTML with text overlay on page images
-        
-        Args:
-            page_texts: List of dictionaries with page text elements and positions
-            page_images: List of base64-encoded image strings for each page
-            
-        Returns:
-            HTML content as string
-        """
-        logger.info("Generating HTML with text overlay")
-        
-        # Start HTML document
-        html = [
-            '<!DOCTYPE html>',
-            '<html lang="en">',
-            '<head>',
-            '  <meta charset="UTF-8">',
-            '  <meta name="viewport" content="width=device-width, initial-scale=1.0">',
-            '  <title>PDF Document</title>',
-            '  <style>',
-            '    body { margin: 0; padding: 0; background-color: #f0f0f0; font-family: Arial, sans-serif; }',
-            '    .pdf-container { display: flex; flex-direction: column; align-items: center; }',
-            '    .pdf-page { position: relative; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); background-color: white; }',
-            '    .page-image { width: 100%; height: auto; display: block; }',
-            '    .text-layer { position: absolute; top: 0; left: 0; right: 0; bottom: 0; overflow: hidden; opacity: 1; line-height: 1; }',
-            '    .text-element { position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; pointer-events: all; }',
-            '    .text-element:hover { background-color: rgba(180, 0, 170, 0.2); }',
-            '  </style>',
-            '</head>',
-            '<body>',
-            '  <div class="pdf-container">'
-        ]
-        
-        # Process each page
-        for i, (page_text, page_image) in enumerate(zip(page_texts, page_images)):
-            page_number = i + 1
-            aspect_ratio = page_text['height'] / page_text['width']
-            
-            # Page container
-            html.append(f'    <div id="page-{page_number}" class="pdf-page" style="width: 100%; max-width: 1000px;">')
-            
-            # Page image with base64 encoding
-            html.append(f'      <img class="page-image" src="{page_image}" alt="Page {page_number}" '
-                        f'style="aspect-ratio: {1/aspect_ratio};">')
-            
-            # Text layer
-            html.append('      <div class="text-layer">')
-            
-            # Add each text element
-            for elem in page_text['text_elements']:
-                escaped_text = elem['text'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                
-                # Position the text element using absolute positioning with percentages
-                html.append(f'        <div class="text-element pdf-text" '
-                            f'style="left: {elem["left"]}%; top: {elem["top"]}%; '
-                            f'width: {elem["width"]}%; height: {elem["height"]}%; '
-                            f'font-size: {elem["font_size"] * 0.8}px;">'
-                            f'{escaped_text}</div>')
-            
-            html.append('      </div>')  # End text layer
-            html.append('    </div>')    # End page container
-        
-        # End HTML document
-        html.extend([
-            '  </div>',
-            '  <script>',
-            '    // Script to make text selectable and apply any needed interactivity',
-            '    document.addEventListener("DOMContentLoaded", function() {',
-            '      const textElements = document.querySelectorAll(".text-element");',
-            '      textElements.forEach(el => {',
-            '        el.style.userSelect = "text";',
-            '        el.style.cursor = "text";',
-            '      });',
-            '    });',
-            '  </script>',
-            '</body>',
-            '</html>'
-        ])
-        
-        return '\n'.join(html)
+            # If pdf2htmlEX fails for any reason, try the alternative method
+            logger.info("Falling back to alternative converter after exception")
+            return alternative_converter.convert_from_file(pdf_path)
 
-
-def convert_from_file(pdf_path: str) -> Tuple[str, str]:
-    """
-    Convert PDF file to HTML (helper function)
-    
-    Args:
-        pdf_path: Path to the PDF file
-        
-    Returns:
-        Tuple[str, str]: HTML content and output path
-    """
-    converter = AlternativePdfConverter()
-    return converter.convert_pdf_to_html(pdf_path)
-
-
-def convert_from_bytes(pdf_bytes: bytes) -> Tuple[str, str]:
-    """
-    Convert PDF bytes to HTML (helper function)
-    
-    Args:
-        pdf_bytes: PDF content as bytes
-        
-    Returns:
-        Tuple[str, str]: HTML content and output path
-    """
-    # Save bytes to temporary file
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-    
+@app.route('/convert-url', methods=['POST'])
+def convert_url():
+    """Convert PDF from URL to HTML"""
     try:
-        # Convert the temporary file
-        converter = AlternativePdfConverter()
-        return converter.convert_pdf_to_html(tmp_path)
-    finally:
-        # Clean up the temporary file
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'error': 'No URL provided'}), 400
+        
+        url = data['url']
+        pdf_path = download_pdf(url)
+        html_content, _ = convert_pdf_to_html(pdf_path)
+        
+        # Clean up the PDF file
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        
+        return Response(html_content, mimetype='text/html')
+    except Exception as e:
+        logger.exception("Error in convert-url endpoint")
+        return jsonify({'error': str(e)}), 500
 
+@app.route('/convert', methods=['POST'])
+def convert_file():
+    """Convert uploaded PDF file to HTML"""
+    try:
+        if 'file' in request.files:
+            # Handle multipart/form-data upload
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+            
+            filename = secure_filename(file.filename)
+            pdf_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}_{filename}")
+            file.save(pdf_path)
+            
+        elif request.content_type == 'application/pdf':
+            # Handle direct binary upload
+            pdf_data = request.data
+            if not pdf_data:
+                return jsonify({'error': 'No PDF data received'}), 400
+            
+            pdf_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.pdf")
+            with open(pdf_path, 'wb') as f:
+                f.write(pdf_data)
+        else:
+            return jsonify({'error': 'Invalid request format'}), 400
+        
+        html_content, _ = convert_pdf_to_html(pdf_path)
+        
+        # Clean up the PDF file
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        
+        return Response(html_content, mimetype='text/html')
+    except Exception as e:
+        logger.exception("Error in convert endpoint")
+        return jsonify({'error': str(e)}), 500
 
-if __name__ == "__main__":
-    # Example usage
-    import sys
+# Cleanup task
+@app.before_first_request
+def setup_cleanup():
+    """Set up a background task to clean up old temporary files"""
+    def cleanup_old_files():
+        import threading
+        import time
+        
+        def run_cleanup():
+            while True:
+                logger.info("Running cleanup task")
+                try:
+                    # Remove files older than 1 hour
+                    now = time.time()
+                    for root, dirs, files in os.walk(TEMP_DIR):
+                        for f in files:
+                            filepath = os.path.join(root, f)
+                            if os.path.isfile(filepath):
+                                if os.stat(filepath).st_mtime < now - 3600:  # 1 hour
+                                    try:
+                                        os.remove(filepath)
+                                        logger.info(f"Removed old file: {filepath}")
+                                    except Exception as e:
+                                        logger.error(f"Error removing file {filepath}: {str(e)}")
+                        
+                        # Also clean up empty directories
+                        for d in dirs:
+                            dirpath = os.path.join(root, d)
+                            if not os.listdir(dirpath):  # Check if directory is empty
+                                try:
+                                    os.rmdir(dirpath)
+                                    logger.info(f"Removed empty directory: {dirpath}")
+                                except Exception as e:
+                                    logger.error(f"Error removing directory {dirpath}: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Error in cleanup task: {str(e)}")
+                
+                # Sleep for 30 minutes before next cleanup
+                time.sleep(1800)
+        
+        # Start the cleanup thread
+        cleanup_thread = threading.Thread(target=run_cleanup, daemon=True)
+        cleanup_thread.start()
     
-    if len(sys.argv) < 2:
-        print("Usage: python alternative_converter.py <pdf_file>")
-        sys.exit(1)
-        
-    pdf_file = sys.argv[1]
-    if not os.path.exists(pdf_file):
-        print(f"Error: File {pdf_file} does not exist")
-        sys.exit(1)
-        
-    html_content, output_path = convert_from_file(pdf_file)
-    print(f"PDF converted to HTML: {output_path}")
+    # Run the setup
+    cleanup_old_files()
+
+if __name__ == '__main__':
+    # Create gunicorn compatible entry point
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 3001)), debug=False)
