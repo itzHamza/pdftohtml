@@ -8,11 +8,17 @@ from io import BytesIO
 import logging
 from werkzeug.utils import secure_filename
 
-# Import Spire.PDF for Python
-# You'll need to install this with: pip install spire.pdf
-from spire.pdf import PdfDocument, PdfPageBase
-from spire.pdf.common import PdfHtmlLayoutFormat
-from spire.pdf.conversion import HtmlConverter
+# Check if Spire.PDF is available, if not use alternative converter
+try:
+    # Import Spire.PDF for Python
+    from spire.pdf import PdfDocument, PdfPageBase
+    from spire.pdf.common import PdfHtmlLayoutFormat
+    from spire.pdf.conversion import HtmlConverter
+    use_spire = True
+except ImportError:
+    use_spire = False
+    # We'll define an alternative conversion method below
+    logging.warning("Spire.PDF not found. Using fallback conversion method.")
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -24,6 +30,14 @@ logger = logging.getLogger(__name__)
 # Create temp directory for storing files if it doesn't exist
 TEMP_DIR = os.path.join(tempfile.gettempdir(), 'pdf-converter')
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Create a requirements variable to help with debugging
+required_packages = """
+Flask==2.0.1
+flask-cors==3.0.10
+requests==2.26.0
+PyPDF2>=3.0.0
+"""
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -117,6 +131,13 @@ def convert_url():
         return jsonify({"error": str(e)}), 500
 
 def convert_pdf_to_html(pdf_path, html_path):
+    """Convert PDF to HTML using available method"""
+    if use_spire:
+        return convert_with_spire(pdf_path, html_path)
+    else:
+        return convert_with_fallback(pdf_path, html_path)
+
+def convert_with_spire(pdf_path, html_path):
     """Convert PDF to HTML using Spire.PDF"""
     try:
         # Load PDF document
@@ -212,6 +233,180 @@ def convert_pdf_to_html(pdf_path, html_path):
     except Exception as e:
         logger.error(f"Error in PDF to HTML conversion: {str(e)}")
         raise e
+
+def convert_with_fallback(pdf_path, html_path):
+    """
+    Fallback conversion method that uses pdfminer.six if available,
+    otherwise returns a simple HTML page
+    """
+    try:
+        # Try to import pdfminer.six
+        try:
+            from pdfminer.high_level import extract_text_to_fp
+            from pdfminer.layout import LAParams
+            import io
+            
+            logger.info("Using pdfminer.six for conversion")
+            
+            # Extract text from PDF
+            output_string = io.StringIO()
+            with open(pdf_path, 'rb') as fin:
+                extract_text_to_fp(fin, output_string, laparams=LAParams(), 
+                                  output_type='html', codec=None)
+            
+            # Basic styling for the HTML
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
+                    .pdf-page {{ 
+                        position: relative;
+                        margin-bottom: 20px;
+                        padding: 20px;
+                        background-color: white;
+                        box-shadow: 0 0 10px rgba(0,0,0,0.3);
+                        transform-origin: top center;
+                        width: 800px;
+                        margin-left: auto;
+                        margin-right: auto;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="pdf-page">
+                    {output_string.getvalue()}
+                </div>
+            </body>
+            </html>
+            """
+            
+            # Write HTML to file
+            with open(html_path, 'w', encoding='utf-8') as html_file:
+                html_file.write(html_content)
+                
+        except ImportError:
+            logger.warning("pdfminer.six not available, using simple text extraction")
+            
+            # Try to use PyPDF2 as a last resort
+            try:
+                import PyPDF2
+                
+                pdf_reader = PyPDF2.PdfReader(pdf_path)
+                text_content = ""
+                
+                # Extract text from each page
+                for page_num in range(len(pdf_reader.pages)):
+                    page = pdf_reader.pages[page_num]
+                    text_content += page.extract_text() + "\n\n"
+                
+                # Create simple HTML
+                html_content = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
+                        .pdf-page {{ 
+                            position: relative;
+                            margin-bottom: 20px;
+                            padding: 20px;
+                            background-color: white;
+                            box-shadow: 0 0 10px rgba(0,0,0,0.3);
+                            transform-origin: top center;
+                            width: 800px;
+                            margin-left: auto;
+                            margin-right: auto;
+                        }}
+                        pre {{ 
+                            white-space: pre-wrap;
+                            word-wrap: break-word;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div class="pdf-page">
+                        <pre>{text_content}</pre>
+                    </div>
+                </body>
+                </html>
+                """
+                
+                # Write HTML to file
+                with open(html_path, 'w', encoding='utf-8') as html_file:
+                    html_file.write(html_content)
+                    
+            except ImportError:
+                # If all else fails, generate a simple message
+                html_content = """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+                        .error { color: #721c24; background-color: #f8d7da; padding: 20px; border-radius: 5px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="error">
+                        <h2>PDF Conversion Notice</h2>
+                        <p>No PDF conversion libraries are available on this system.</p>
+                        <p>Please install one of the following packages:</p>
+                        <ul style="text-align: left; display: inline-block;">
+                            <li>spire.pdf</li>
+                            <li>pdfminer.six</li>
+                            <li>PyPDF2</li>
+                        </ul>
+                    </div>
+                </body>
+                </html>
+                """
+                
+                # Write HTML to file
+                with open(html_path, 'w', encoding='utf-8') as html_file:
+                    html_file.write(html_content)
+        
+        # Read the generated HTML file
+        with open(html_path, 'r', encoding='utf-8') as html_file:
+            content = html_file.read()
+        
+        # Clean up the HTML file
+        try:
+            os.remove(html_path)
+        except Exception as e:
+            logger.warning(f"Could not remove temporary HTML file: {e}")
+        
+        return content
+        
+    except Exception as e:
+        logger.error(f"Error in fallback PDF conversion: {str(e)}")
+        
+        # Return an error message as HTML
+        error_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; }}
+                .error {{ color: #721c24; background-color: #f8d7da; padding: 20px; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <div class="error">
+                <h2>PDF Conversion Error</h2>
+                <p>An error occurred while converting the PDF:</p>
+                <p>{str(e)}</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return error_html
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
