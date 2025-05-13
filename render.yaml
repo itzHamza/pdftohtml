@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: pdf2html
-    env: docker
-    plan: free
-    buildCommand: ""
-    startCommand: gunicorn app:app
