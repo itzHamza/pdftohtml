@@ -1,18 +1,18 @@
-#!/usr/bin/env python3
-from flask import Flask, request, send_file, jsonify, Response
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import requests
 import os
-import subprocess
 import tempfile
 import uuid
+import requests
+from io import BytesIO
 import logging
 from werkzeug.utils import secure_filename
-import shutil
-import urllib.parse
 
-# Import the alternative converter
-import alternative_converter
+# Import Spire.PDF for Python
+# You'll need to install this with: pip install spire.pdf
+from spire.pdf import PdfDocument, PdfPageBase
+from spire.pdf.common import PdfHtmlLayoutFormat
+from spire.pdf.conversion import HtmlConverter
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -21,208 +21,198 @@ CORS(app)  # Enable CORS for all routes
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create temporary directory for storing files
-TEMP_DIR = os.path.join(tempfile.gettempdir(), 'pdf2html_temp')
+# Create temp directory for storing files if it doesn't exist
+TEMP_DIR = os.path.join(tempfile.gettempdir(), 'pdf-converter')
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Check if we should use the alternative converter
-USE_ALTERNATIVE = os.environ.get('USE_ALTERNATIVE_CONVERTER', 'false').lower() == 'true'
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint"""
+    return jsonify({"status": "healthy"})
 
-def download_pdf(url):
-    """Download a PDF file from a URL and save it to a temporary file"""
-    logger.info(f"Downloading PDF from URL: {url}")
+@app.route('/convert', methods=['POST'])
+def convert_pdf():
+    """Convert an uploaded PDF file to HTML"""
     try:
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
+        # Check if a file was uploaded
+        if 'file' not in request.files:
+            return jsonify({"error": "No file part"}), 400
         
-        # Extract filename from URL or use a random name
-        filename = os.path.basename(urllib.parse.urlparse(url).path) or f"{uuid.uuid4()}.pdf"
-        filename = secure_filename(filename)
-        if not filename.lower().endswith('.pdf'):
-            filename += '.pdf'
-            
-        filepath = os.path.join(TEMP_DIR, filename)
+        file = request.files['file']
         
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-                
-        logger.info(f"PDF downloaded successfully to {filepath}")
-        return filepath
-    except Exception as e:
-        logger.error(f"Error downloading PDF: {str(e)}")
-        raise
-
-def convert_pdf_to_html(pdf_path):
-    """Convert PDF to HTML using pdf2htmlEX or the alternative converter"""
-    logger.info(f"Converting PDF to HTML: {pdf_path}")
+        # Check if file is empty
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        # Check if file is a PDF
+        if not file.filename.lower().endswith('.pdf'):
+            return jsonify({"error": "File must be a PDF"}), 400
+        
+        # Create a unique filename
+        unique_id = str(uuid.uuid4())
+        pdf_path = os.path.join(TEMP_DIR, f"{unique_id}.pdf")
+        html_path = os.path.join(TEMP_DIR, f"{unique_id}.html")
+        
+        # Save the uploaded file
+        file.save(pdf_path)
+        logger.info(f"PDF saved to {pdf_path}")
+        
+        # Convert PDF to HTML using Spire.PDF
+        html_content = convert_pdf_to_html(pdf_path, html_path)
+        
+        # Clean up the temporary PDF file
+        try:
+            os.remove(pdf_path)
+        except Exception as e:
+            logger.warning(f"Could not remove temporary PDF file: {e}")
+        
+        return html_content
     
-    if USE_ALTERNATIVE:
-        logger.info("Using alternative PDF converter")
-        try:
-            html_content, output_path = alternative_converter.convert_from_file(pdf_path)
-            return html_content, output_path
-        except Exception as e:
-            logger.error(f"Alternative conversion failed: {str(e)}")
-            raise Exception(f"PDF conversion failed: {str(e)}")
-    else:
-        # Use original pdf2htmlEX method
-        logger.info("Using pdf2htmlEX converter")
-        
-        # Create a unique output directory
-        output_dir = os.path.join(TEMP_DIR, str(uuid.uuid4()))
-        os.makedirs(output_dir, exist_ok=True)
-        
-        filename = os.path.basename(pdf_path)
-        output_filename = os.path.splitext(filename)[0] + '.html'
-        output_path = os.path.join(output_dir, output_filename)
-        
-        try:
-            # pdf2htmlEX command with options to preserve text selection
-            cmd = [
-                'pdf2htmlEX',
-                '--zoom', '1.3',  # Scale factor
-                '--fit-width', '1024',  # Target page width
-                '--process-outline', '0',  # Skip outline processing for speed
-                '--dest-dir', output_dir,  # Output directory
-                '--optimize-text', '1',  # Optimize text for selection
-                '--font-format', 'woff',  # Use WOFF format for fonts
-                '--data-dir', output_dir,  # Directory for data files
-                '--split-pages', '0',  # Don't split pages into separate files
-                '--embed', 'cfijo',  # Embed: css,fonts,images,javascript,outline
-                pdf_path,
-                output_filename
-            ]
-            
-            logger.info(f"Running command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logger.error(f"pdf2htmlEX error: {result.stderr}")
-                
-                # If pdf2htmlEX fails, try the alternative method
-                logger.info("Falling back to alternative converter")
-                return alternative_converter.convert_from_file(pdf_path)
-            
-            logger.info(f"PDF successfully converted to HTML: {output_path}")
-            
-            # Read the HTML file
-            with open(output_path, 'r', encoding='utf-8') as f:
-                html_content = f.read()
-            
-            return html_content, output_path
-        except Exception as e:
-            logger.error(f"Error with pdf2htmlEX: {str(e)}")
-            
-            # If pdf2htmlEX fails for any reason, try the alternative method
-            logger.info("Falling back to alternative converter after exception")
-            return alternative_converter.convert_from_file(pdf_path)
+    except Exception as e:
+        logger.error(f"Error in PDF conversion: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/convert-url', methods=['POST'])
 def convert_url():
-    """Convert PDF from URL to HTML"""
+    """Convert a PDF from a URL to HTML"""
     try:
+        # Get URL from request body
         data = request.get_json()
         if not data or 'url' not in data:
-            return jsonify({'error': 'No URL provided'}), 400
+            return jsonify({"error": "URL is required"}), 400
         
         url = data['url']
-        pdf_path = download_pdf(url)
-        html_content, _ = convert_pdf_to_html(pdf_path)
+        logger.info(f"Processing PDF from URL: {url}")
         
-        # Clean up the PDF file
-        if os.path.exists(pdf_path):
+        # Download the PDF file
+        response = requests.get(url, stream=True)
+        if response.status_code != 200:
+            return jsonify({"error": f"Failed to download PDF. Status code: {response.status_code}"}), 400
+        
+        # Create temporary files
+        unique_id = str(uuid.uuid4())
+        pdf_path = os.path.join(TEMP_DIR, f"{unique_id}.pdf")
+        html_path = os.path.join(TEMP_DIR, f"{unique_id}.html")
+        
+        # Save the downloaded file
+        with open(pdf_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        logger.info(f"Downloaded PDF saved to {pdf_path}")
+        
+        # Convert PDF to HTML using Spire.PDF
+        html_content = convert_pdf_to_html(pdf_path, html_path)
+        
+        # Clean up the temporary PDF file
+        try:
             os.remove(pdf_path)
+        except Exception as e:
+            logger.warning(f"Could not remove temporary PDF file: {e}")
         
-        return Response(html_content, mimetype='text/html')
-    except Exception as e:
-        logger.exception("Error in convert-url endpoint")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/convert', methods=['POST'])
-def convert_file():
-    """Convert uploaded PDF file to HTML"""
-    try:
-        if 'file' in request.files:
-            # Handle multipart/form-data upload
-            file = request.files['file']
-            if file.filename == '':
-                return jsonify({'error': 'No file selected'}), 400
-            
-            filename = secure_filename(file.filename)
-            pdf_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}_{filename}")
-            file.save(pdf_path)
-            
-        elif request.content_type == 'application/pdf':
-            # Handle direct binary upload
-            pdf_data = request.data
-            if not pdf_data:
-                return jsonify({'error': 'No PDF data received'}), 400
-            
-            pdf_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.pdf")
-            with open(pdf_path, 'wb') as f:
-                f.write(pdf_data)
-        else:
-            return jsonify({'error': 'Invalid request format'}), 400
-        
-        html_content, _ = convert_pdf_to_html(pdf_path)
-        
-        # Clean up the PDF file
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
-        
-        return Response(html_content, mimetype='text/html')
-    except Exception as e:
-        logger.exception("Error in convert endpoint")
-        return jsonify({'error': str(e)}), 500
-
-# Cleanup task
-@app.before_first_request
-def setup_cleanup():
-    """Set up a background task to clean up old temporary files"""
-    def cleanup_old_files():
-        import threading
-        import time
-        
-        def run_cleanup():
-            while True:
-                logger.info("Running cleanup task")
-                try:
-                    # Remove files older than 1 hour
-                    now = time.time()
-                    for root, dirs, files in os.walk(TEMP_DIR):
-                        for f in files:
-                            filepath = os.path.join(root, f)
-                            if os.path.isfile(filepath):
-                                if os.stat(filepath).st_mtime < now - 3600:  # 1 hour
-                                    try:
-                                        os.remove(filepath)
-                                        logger.info(f"Removed old file: {filepath}")
-                                    except Exception as e:
-                                        logger.error(f"Error removing file {filepath}: {str(e)}")
-                        
-                        # Also clean up empty directories
-                        for d in dirs:
-                            dirpath = os.path.join(root, d)
-                            if not os.listdir(dirpath):  # Check if directory is empty
-                                try:
-                                    os.rmdir(dirpath)
-                                    logger.info(f"Removed empty directory: {dirpath}")
-                                except Exception as e:
-                                    logger.error(f"Error removing directory {dirpath}: {str(e)}")
-                except Exception as e:
-                    logger.error(f"Error in cleanup task: {str(e)}")
-                
-                # Sleep for 30 minutes before next cleanup
-                time.sleep(1800)
-        
-        # Start the cleanup thread
-        cleanup_thread = threading.Thread(target=run_cleanup, daemon=True)
-        cleanup_thread.start()
+        return html_content
     
-    # Run the setup
-    cleanup_old_files()
+    except Exception as e:
+        logger.error(f"Error in URL conversion: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def convert_pdf_to_html(pdf_path, html_path):
+    """Convert PDF to HTML using Spire.PDF"""
+    try:
+        # Load PDF document
+        pdf = PdfDocument()
+        pdf.LoadFromFile(pdf_path)
+        
+        logger.info(f"PDF loaded with {pdf.Pages.Count} pages")
+        
+        # Configure HTML conversion options
+        options = PdfHtmlLayoutFormat()
+        options.IsEmbedImages = True
+        options.IsEmbedFonts = True
+        options.IsEmbedCss = True
+        
+        # Convert to HTML
+        with open(html_path, 'w', encoding='utf-8') as html_file:
+            # Initialize HTML string with necessary styling
+            html_content = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    .pdf-page {
+                        position: relative;
+                        margin-bottom: 20px;
+                        background-color: white;
+                        box-shadow: 0 0 10px rgba(0,0,0,0.3);
+                        transform-origin: top center;
+                    }
+                    .text-layer {
+                        position: absolute;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        overflow: hidden;
+                        user-select: text;
+                        pointer-events: auto;
+                    }
+                    .pdf-text {
+                        position: absolute;
+                        white-space: pre;
+                        cursor: text;
+                        transform-origin: 0% 0%;
+                    }
+                </style>
+            </head>
+            <body>
+            """
+            
+            # Process each page
+            for i in range(pdf.Pages.Count):
+                page = pdf.Pages[i]
+                page_width = page.Size.Width
+                page_height = page.Size.Height
+                
+                # Add page div
+                html_content += f'<div class="pdf-page" style="width:{page_width}px;height:{page_height}px;">\n'
+                
+                # Convert page to HTML
+                page_html = HtmlConverter.ToHtml(page, options)
+                
+                # Create text layer with the HTML content
+                html_content += f'<div class="text-layer">{page_html}</div>\n'
+                
+                # Close page div
+                html_content += '</div>\n'
+            
+            # Close HTML document
+            html_content += """
+            </body>
+            </html>
+            """
+            
+            # Write to file
+            html_file.write(html_content)
+        
+        logger.info(f"HTML saved to {html_path}")
+        
+        # Read the HTML file to return its content
+        with open(html_path, 'r', encoding='utf-8') as html_file:
+            content = html_file.read()
+        
+        # Clean up the HTML file
+        try:
+            os.remove(html_path)
+        except Exception as e:
+            logger.warning(f"Could not remove temporary HTML file: {e}")
+        
+        return content
+    
+    except Exception as e:
+        logger.error(f"Error in PDF to HTML conversion: {str(e)}")
+        raise e
 
 if __name__ == '__main__':
-    # Create gunicorn compatible entry point
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 3001)), debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
