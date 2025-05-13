@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements file
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python dependencies with strict versioning
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
@@ -25,6 +25,9 @@ ENV PYTHONUNBUFFERED=1
 
 # Expose the port
 EXPOSE 8080
+
+# Create temp directory for file processing
+RUN mkdir -p /tmp/pdf-converter
 
 # Run the application with Gunicorn
 CMD gunicorn --bind 0.0.0.0:$PORT app:app
