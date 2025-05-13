@@ -1,33 +1,18 @@
-FROM python:3.9-slim
+# Use lightweight Python base image
+FROM python:3.11-slim
 
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies for PDF processing
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libpoppler-cpp-dev \
-    pkg-config \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements file
+# Copy dependency list and install
 COPY requirements.txt .
-
-# Install Python dependencies with strict versioning
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY app.py .
+COPY . .
 
-# Set environment variables
-ENV PORT=8080
-ENV PYTHONUNBUFFERED=1
-
-# Expose the port
+# Expose default port (Railway will override it via $PORT)
 EXPOSE 8080
 
-# Create temp directory for file processing
-RUN mkdir -p /tmp/pdf-converter
-
 # Run the application with Gunicorn
-CMD gunicorn --bind 0.0.0.0:$PORT app:app
+CMD gunicorn --bind 0.0.0.0:8080 main:app
