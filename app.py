@@ -1,413 +1,414 @@
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import os
-import tempfile
+from flask import Flask, request, jsonify
+import fitz  # PyMuPDF
+import base64
+import io
+from PIL import Image
+import re
 import uuid
-import requests
-from io import BytesIO
+import os
+import traceback
+from flask_cors import CORS
 import logging
-from werkzeug.utils import secure_filename
+from concurrent.futures import ThreadPoolExecutor
+import time
 
-# Check if Spire.PDF is available, if not use alternative converter
-try:
-    # Import Spire.PDF for Python
-    from spire.pdf import PdfDocument, PdfPageBase
-    from spire.pdf.common import PdfHtmlLayoutFormat
-    from spire.pdf.conversion import HtmlConverter
-    use_spire = True
-except ImportError:
-    use_spire = False
-    # We'll define an alternative conversion method below
-    logging.warning("Spire.PDF not found. Using fallback conversion method.")
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configuration settings
+MAX_WORKERS = 4  # Number of worker threads for parallel processing
+FONT_SCALE_FACTOR = 0.85  # Scale down fonts by 15%
+IMAGE_QUALITY = 85  # JPEG quality for image compression
+CACHE_CONTROL = 'public, max-age=86400'  # Cache for 24 hours
+ENABLE_TEXT_SPACING = True  # Add letter-spacing to improve readability
 
-# Create temp directory for storing files if it doesn't exist
-TEMP_DIR = os.path.join(tempfile.gettempdir(), 'pdf-converter')
-os.makedirs(TEMP_DIR, exist_ok=True)
+def sanitize_text(text):
+    """Clean up text extracted from PDF"""
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    # Escape HTML special characters
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return text.strip()
 
-# Create a requirements variable to help with debugging
-required_packages = """
-Flask==2.0.1
-flask-cors==3.0.10
-requests==2.26.0
-PyPDF2>=3.0.0
-"""
+def optimize_image(pixmap, quality=IMAGE_QUALITY):
+    """Convert pixmap to optimized base64 data URL"""
+    try:
+        start_time = time.time()
+        
+        # Determine format based on pixmap characteristics
+        img_format = "jpeg" if pixmap.n >= 3 else "png"
+        
+        # Convert pixmap to PIL Image
+        if pixmap.n >= 3:
+            pil_img = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+        else:
+            pil_img = Image.frombytes("L", [pixmap.width, pixmap.height], pixmap.samples)
+        
+        # Optimize image size if larger than threshold
+        max_dimension = max(pixmap.width, pixmap.height)
+        if max_dimension > 1200:
+            scale_factor = 1200 / max_dimension
+            new_width = int(pixmap.width * scale_factor)
+            new_height = int(pixmap.height * scale_factor)
+            pil_img = pil_img.resize((new_width, new_height), Image.LANCZOS)
+            
+        # Save to bytes buffer with quality setting
+        buffer = io.BytesIO()
+        if img_format == "jpeg":
+            pil_img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        else:
+            pil_img.save(buffer, format="PNG", optimize=True)
+            
+        img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        logger.debug(f"Image optimization took {time.time() - start_time:.2f}s, reduced to {len(img_str)} chars")
+        
+        # Return as data URL
+        return f"data:image/{img_format};base64,{img_str}"
+    except Exception as e:
+        logger.error(f"Error processing image: {str(e)}")
+        logger.error(traceback.format_exc())
+        return ""  # Return empty string on error
+
+def process_page(doc, page_num, page):
+    """Process a single PDF page (for parallel execution)"""
+    try:
+        start_time = time.time()
+        logger.debug(f"Processing page {page_num+1}")
+        
+        width, height = page.rect.width, page.rect.height
+        
+        # Start a new page div
+        html_parts = [f'<div class="pdf-page" style="width:{width}px;height:{height}px;">']
+        
+        # Extract text with positions
+        text_blocks = page.get_text("dict")["blocks"]
+        html_parts.append('<div class="text-layer">')
+        
+        # Process text blocks
+        for block in text_blocks:
+            if block["type"] == 0:  # Text block
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        text = sanitize_text(span["text"])
+                        if not text:
+                            continue
+                            
+                        # Get text position and styling
+                        x0, y0 = span["origin"]
+                        
+                        # Scale down font size to reduce overlap
+                        font_size = span["size"] * FONT_SCALE_FACTOR
+                        
+                        # Determine text color
+                        if isinstance(span["color"], (list, tuple)):
+                            r, g, b = span["color"][:3]
+                            font_color = f"#{r:02x}{g:02x}{b:02x}"
+                        else:
+                            # Handle grayscale color
+                            color_val = span["color"]
+                            font_color = f"#{color_val:02x}{color_val:02x}{color_val:02x}"
+                        
+                        # Calculate font weight
+                        font_flags = span.get("flags", 0)
+                        font_weight = "bold" if font_flags & 2**4 else "normal"  # Check if bold flag is set
+                        
+                        # Calculate letter spacing to reduce overlap
+                        letter_spacing = "0.02em" if ENABLE_TEXT_SPACING else "normal"
+                        
+                        # Add text with improved positioning and styling
+                        html_parts.append(
+                            f'<div class="pdf-text" style="left:{x0}px;top:{y0}px;'
+                            f'font-size:{font_size}px;color:{font_color};'
+                            f'font-weight:{font_weight};letter-spacing:{letter_spacing};">{text}</div>'
+                        )
+                        
+        html_parts.append('</div>')  # Close text layer
+        
+        # Extract and embed images
+        images_html = []
+        try:
+            images = page.get_images(full=True)
+            for img_index, img_info in enumerate(images):
+                try:
+                    if not img_info or len(img_info) < 3:
+                        logger.warning(f"Skipping invalid image info on page {page_num+1}")
+                        continue
+                        
+                    # Extract xref from image info
+                    xref = img_info[0] if isinstance(img_info[0], int) else img_info[1]
+                    
+                    # Get the image
+                    try:
+                        base_img = doc.extract_image(xref)
+                        pixmap = fitz.Pixmap(doc, xref)
+                    except Exception as e:
+                        logger.error(f"Error extracting image {xref}: {str(e)}")
+                        continue
+                    
+                    # Skip problem images
+                    if pixmap.width < 10 or pixmap.height < 10 or pixmap.width > 5000 or pixmap.height > 5000:
+                        logger.warning(f"Skipping problematic image (size: {pixmap.width}x{pixmap.height}) on page {page_num+1}")
+                        continue
+                    
+                    # Find image position in the page
+                    x0, y0, x1, y1 = 0, 0, pixmap.width, pixmap.height
+                    for img_block in text_blocks:
+                        if img_block.get("type") == 1:  # Image block
+                            bbox = img_block.get("bbox")
+                            if bbox:
+                                x0, y0, x1, y1 = bbox
+                    
+                    # Convert image to data URL with optimization
+                    data_url = optimize_image(pixmap)
+                    if data_url:  # Only add if we got a valid data URL
+                        # Add image with positioning
+                        images_html.append(
+                            f'<img class="pdf-image" src="{data_url}" style="'
+                            f'left:{x0}px;top:{y0}px;width:{x1-x0}px;height:{y1-y0}px;" '
+                            f'loading="lazy" alt="PDF image {img_index}">'
+                        )
+                except Exception as e:
+                    logger.error(f"Error processing image {img_index} on page {page_num+1}: {str(e)}")
+                    continue
+        except Exception as e:
+            logger.error(f"Error extracting images from page {page_num+1}: {str(e)}")
+        
+        # Append images after text layer for better z-ordering
+        html_parts.extend(images_html)
+        
+        html_parts.append('</div>')  # Close page div
+        
+        logger.debug(f"Page {page_num+1} processed in {time.time() - start_time:.2f}s")
+        return ''.join(html_parts)
+    
+    except Exception as e:
+        logger.error(f"Error processing page {page_num+1}: {str(e)}")
+        return f'<div class="error-page">Error rendering page {page_num+1}: {str(e)}</div>'
+
+def pdf_to_html(pdf_data):
+    """Convert PDF data to HTML with text and embedded images using parallel processing"""
+    start_time = time.time()
+    
+    # Open the PDF from binary data
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
+    page_count = len(doc)
+    logger.info(f"Converting PDF with {page_count} pages")
+    
+    # Generate CSS with improved styling
+    css = '''
+    .pdf-page { 
+        position: relative; 
+        margin-bottom: 20px; 
+        border: 1px solid #ddd; 
+        background: white;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        overflow: hidden;
+    }
+    .text-layer { 
+        position: absolute; 
+        top: 0; 
+        left: 0; 
+        right: 0; 
+        bottom: 0;
+        pointer-events: none;
+        line-height: normal;
+    }
+    .pdf-text { 
+        position: absolute; 
+        white-space: nowrap;
+        transform-origin: left top;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .pdf-image { 
+        position: absolute;
+        z-index: 1;
+    }
+    @media print {
+        .pdf-page {
+            break-inside: avoid;
+            page-break-inside: avoid;
+            margin: 0;
+            border: none;
+            box-shadow: none;
+        }
+    }
+    '''
+    
+    # Start HTML document
+    html_parts = [
+        '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+        f'<style>{css}</style>',
+        f'<title>PDF Document ({page_count} pages)</title>',
+        '</head><body>'
+    ]
+    
+    # Process pages in parallel for better performance
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all page processing tasks
+        future_to_page = {
+            executor.submit(process_page, doc, i, page): i 
+            for i, page in enumerate(doc)
+        }
+        
+        # Add pages in order as they complete
+        for future in sorted(future_to_page, key=lambda x: future_to_page[x]):
+            html_parts.append(future.result())
+    
+    # Add script for lazy loading and visibility optimization
+    js_code = '''
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {
+        // Lazy loading for images
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    const page = entry.target;
+                    // Show images in this page if they were hidden
+                    const images = page.querySelectorAll('img[data-src]');
+                    images.forEach(img => {
+                        img.src = img.dataset.src;
+                        img.removeAttribute('data-src');
+                    });
+                    observer.unobserve(page);
+                }
+            });
+        }, {
+            rootMargin: '200px 0px',
+            threshold: 0.01
+        });
+        
+        // Observe all pages
+        document.querySelectorAll('.pdf-page').forEach(page => {
+            observer.observe(page);
+        });
+    });
+    </script>
+    '''
+    
+    html_parts.append(js_code)
+    html_parts.append('</body></html>')
+    
+    final_html = ''.join(html_parts)
+    logger.info(f"PDF conversion completed in {time.time() - start_time:.2f}s, generated {len(final_html)} bytes of HTML")
+    
+    return final_html
+
+@app.route('/convert', methods=['POST'])
+def convert():
+    try:
+        request_start_time = time.time()
+        logger.info(f"Received conversion request. Content-Type: {request.content_type}")
+        
+        # Check if request includes file
+        if 'file' not in request.files:
+            logger.info("No file in request, trying to read raw data")
+            pdf_data = request.data
+            if not pdf_data:
+                logger.error("No PDF data provided")
+                return jsonify({'error': 'No PDF data provided'}), 400
+            logger.info(f"Read {len(pdf_data)} bytes of raw PDF data")
+        else:
+            logger.info("File found in request")
+            pdf_file = request.files['file']
+            pdf_data = pdf_file.read()
+            logger.info(f"Read {len(pdf_data)} bytes from uploaded file")
+        
+        # Validate PDF data (basic check)
+        if len(pdf_data) < 4:
+            logger.error(f"PDF data too small: {len(pdf_data)} bytes")
+            return jsonify({'error': 'PDF data too small'}), 400
+        
+        try:
+            # Convert PDF to HTML
+            html_content = pdf_to_html(pdf_data)
+            
+            # Calculate performance metrics
+            total_time = time.time() - request_start_time
+            logger.info(f"Total request processing time: {total_time:.2f}s")
+            
+            # Set cache headers for better client-side performance
+            response_headers = {
+                'Content-Type': 'text/html',
+                'Cache-Control': CACHE_CONTROL,
+                'X-Processing-Time': f"{total_time:.2f}s"
+            }
+            
+            return html_content, 200, response_headers
+            
+        except Exception as e:
+            logger.error(f"Error in pdf_to_html: {str(e)}")
+            logger.error(traceback.format_exc())
+            return jsonify({'error': f'PDF conversion error: {str(e)}'}), 500
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint"""
-    return jsonify({"status": "healthy"})
+    version_info = {
+        'pymupdf_version': fitz.version[0],
+        'flask_version': Flask.__version__,
+        'python_version': os.sys.version,
+        'workers': MAX_WORKERS,
+        'font_scale': FONT_SCALE_FACTOR
+    }
+    return jsonify({
+        'status': 'ok', 
+        'versions': version_info,
+        'config': {
+            'max_workers': MAX_WORKERS,
+            'font_scale': FONT_SCALE_FACTOR,
+            'image_quality': IMAGE_QUALITY,
+            'text_spacing': ENABLE_TEXT_SPACING
+        }
+    }), 200
 
-@app.route('/convert', methods=['POST'])
-def convert_pdf():
-    """Convert an uploaded PDF file to HTML"""
-    try:
-        # Check if a file was uploaded
-        if 'file' not in request.files:
-            return jsonify({"error": "No file part"}), 400
-        
-        file = request.files['file']
-        
-        # Check if file is empty
-        if file.filename == '':
-            return jsonify({"error": "No file selected"}), 400
-        
-        # Check if file is a PDF
-        if not file.filename.lower().endswith('.pdf'):
-            return jsonify({"error": "File must be a PDF"}), 400
-        
-        # Create a unique filename
-        unique_id = str(uuid.uuid4())
-        pdf_path = os.path.join(TEMP_DIR, f"{unique_id}.pdf")
-        html_path = os.path.join(TEMP_DIR, f"{unique_id}.html")
-        
-        # Save the uploaded file
-        file.save(pdf_path)
-        logger.info(f"PDF saved to {pdf_path}")
-        
-        # Convert PDF to HTML using Spire.PDF
-        html_content = convert_pdf_to_html(pdf_path, html_path)
-        
-        # Clean up the temporary PDF file
-        try:
-            os.remove(pdf_path)
-        except Exception as e:
-            logger.warning(f"Could not remove temporary PDF file: {e}")
-        
-        return html_content
+@app.route('/config', methods=['GET', 'POST'])
+def config():
+    global MAX_WORKERS, FONT_SCALE_FACTOR, IMAGE_QUALITY, ENABLE_TEXT_SPACING
     
-    except Exception as e:
-        logger.error(f"Error in PDF conversion: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/convert-url', methods=['POST'])
-def convert_url():
-    """Convert a PDF from a URL to HTML"""
-    try:
-        # Get URL from request body
-        data = request.get_json()
-        if not data or 'url' not in data:
-            return jsonify({"error": "URL is required"}), 400
-        
-        url = data['url']
-        logger.info(f"Processing PDF from URL: {url}")
-        
-        # Download the PDF file
-        response = requests.get(url, stream=True)
-        if response.status_code != 200:
-            return jsonify({"error": f"Failed to download PDF. Status code: {response.status_code}"}), 400
-        
-        # Create temporary files
-        unique_id = str(uuid.uuid4())
-        pdf_path = os.path.join(TEMP_DIR, f"{unique_id}.pdf")
-        html_path = os.path.join(TEMP_DIR, f"{unique_id}.html")
-        
-        # Save the downloaded file
-        with open(pdf_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        logger.info(f"Downloaded PDF saved to {pdf_path}")
-        
-        # Convert PDF to HTML using Spire.PDF
-        html_content = convert_pdf_to_html(pdf_path, html_path)
-        
-        # Clean up the temporary PDF file
+    if request.method == 'POST':
         try:
-            os.remove(pdf_path)
+            data = request.json
+            if data.get('max_workers') is not None:
+                MAX_WORKERS = max(1, min(8, int(data['max_workers'])))
+            if data.get('font_scale') is not None:
+                FONT_SCALE_FACTOR = max(0.5, min(1.5, float(data['font_scale'])))
+            if data.get('image_quality') is not None:
+                IMAGE_QUALITY = max(50, min(100, int(data['image_quality'])))
+            if data.get('text_spacing') is not None:
+                ENABLE_TEXT_SPACING = bool(data['text_spacing'])
+                
+            logger.info(f"Configuration updated: workers={MAX_WORKERS}, font_scale={FONT_SCALE_FACTOR}, "
+                      f"image_quality={IMAGE_QUALITY}, text_spacing={ENABLE_TEXT_SPACING}")
+            
+            return jsonify({'status': 'ok', 'message': 'Configuration updated'})
         except Exception as e:
-            logger.warning(f"Could not remove temporary PDF file: {e}")
-        
-        return html_content
+            logger.error(f"Error updating configuration: {str(e)}")
+            return jsonify({'error': f'Configuration update failed: {str(e)}'}), 400
     
-    except Exception as e:
-        logger.error(f"Error in URL conversion: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-def convert_pdf_to_html(pdf_path, html_path):
-    """Convert PDF to HTML using available method"""
-    if use_spire:
-        return convert_with_spire(pdf_path, html_path)
-    else:
-        return convert_with_fallback(pdf_path, html_path)
-
-def convert_with_spire(pdf_path, html_path):
-    """Convert PDF to HTML using Spire.PDF"""
-    try:
-        # Load PDF document
-        pdf = PdfDocument()
-        pdf.LoadFromFile(pdf_path)
-        
-        logger.info(f"PDF loaded with {pdf.Pages.Count} pages")
-        
-        # Configure HTML conversion options
-        options = PdfHtmlLayoutFormat()
-        options.IsEmbedImages = True
-        options.IsEmbedFonts = True
-        options.IsEmbedCss = True
-        
-        # Convert to HTML
-        with open(html_path, 'w', encoding='utf-8') as html_file:
-            # Initialize HTML string with necessary styling
-            html_content = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <style>
-                    .pdf-page {
-                        position: relative;
-                        margin-bottom: 20px;
-                        background-color: white;
-                        box-shadow: 0 0 10px rgba(0,0,0,0.3);
-                        transform-origin: top center;
-                    }
-                    .text-layer {
-                        position: absolute;
-                        top: 0;
-                        left: 0;
-                        right: 0;
-                        bottom: 0;
-                        overflow: hidden;
-                        user-select: text;
-                        pointer-events: auto;
-                    }
-                    .pdf-text {
-                        position: absolute;
-                        white-space: pre;
-                        cursor: text;
-                        transform-origin: 0% 0%;
-                    }
-                </style>
-            </head>
-            <body>
-            """
-            
-            # Process each page
-            for i in range(pdf.Pages.Count):
-                page = pdf.Pages[i]
-                page_width = page.Size.Width
-                page_height = page.Size.Height
-                
-                # Add page div
-                html_content += f'<div class="pdf-page" style="width:{page_width}px;height:{page_height}px;">\n'
-                
-                # Convert page to HTML
-                page_html = HtmlConverter.ToHtml(page, options)
-                
-                # Create text layer with the HTML content
-                html_content += f'<div class="text-layer">{page_html}</div>\n'
-                
-                # Close page div
-                html_content += '</div>\n'
-            
-            # Close HTML document
-            html_content += """
-            </body>
-            </html>
-            """
-            
-            # Write to file
-            html_file.write(html_content)
-        
-        logger.info(f"HTML saved to {html_path}")
-        
-        # Read the HTML file to return its content
-        with open(html_path, 'r', encoding='utf-8') as html_file:
-            content = html_file.read()
-        
-        # Clean up the HTML file
-        try:
-            os.remove(html_path)
-        except Exception as e:
-            logger.warning(f"Could not remove temporary HTML file: {e}")
-        
-        return content
-    
-    except Exception as e:
-        logger.error(f"Error in PDF to HTML conversion: {str(e)}")
-        raise e
-
-def convert_with_fallback(pdf_path, html_path):
-    """
-    Fallback conversion method that uses pdfminer.six if available,
-    otherwise returns a simple HTML page
-    """
-    try:
-        # Try to import pdfminer.six
-        try:
-            from pdfminer.high_level import extract_text_to_fp
-            from pdfminer.layout import LAParams
-            import io
-            
-            logger.info("Using pdfminer.six for conversion")
-            
-            # Extract text from PDF
-            output_string = io.StringIO()
-            with open(pdf_path, 'rb') as fin:
-                extract_text_to_fp(fin, output_string, laparams=LAParams(), 
-                                  output_type='html', codec=None)
-            
-            # Basic styling for the HTML
-            html_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <style>
-                    body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
-                    .pdf-page {{ 
-                        position: relative;
-                        margin-bottom: 20px;
-                        padding: 20px;
-                        background-color: white;
-                        box-shadow: 0 0 10px rgba(0,0,0,0.3);
-                        transform-origin: top center;
-                        width: 800px;
-                        margin-left: auto;
-                        margin-right: auto;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="pdf-page">
-                    {output_string.getvalue()}
-                </div>
-            </body>
-            </html>
-            """
-            
-            # Write HTML to file
-            with open(html_path, 'w', encoding='utf-8') as html_file:
-                html_file.write(html_content)
-                
-        except ImportError:
-            logger.warning("pdfminer.six not available, using simple text extraction")
-            
-            # Try to use PyPDF2 as a last resort
-            try:
-                import PyPDF2
-                
-                pdf_reader = PyPDF2.PdfReader(pdf_path)
-                text_content = ""
-                
-                # Extract text from each page
-                for page_num in range(len(pdf_reader.pages)):
-                    page = pdf_reader.pages[page_num]
-                    text_content += page.extract_text() + "\n\n"
-                
-                # Create simple HTML
-                html_content = f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <style>
-                        body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
-                        .pdf-page {{ 
-                            position: relative;
-                            margin-bottom: 20px;
-                            padding: 20px;
-                            background-color: white;
-                            box-shadow: 0 0 10px rgba(0,0,0,0.3);
-                            transform-origin: top center;
-                            width: 800px;
-                            margin-left: auto;
-                            margin-right: auto;
-                        }}
-                        pre {{ 
-                            white-space: pre-wrap;
-                            word-wrap: break-word;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="pdf-page">
-                        <pre>{text_content}</pre>
-                    </div>
-                </body>
-                </html>
-                """
-                
-                # Write HTML to file
-                with open(html_path, 'w', encoding='utf-8') as html_file:
-                    html_file.write(html_content)
-                    
-            except ImportError:
-                # If all else fails, generate a simple message
-                html_content = """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="UTF-8">
-                    <style>
-                        body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-                        .error { color: #721c24; background-color: #f8d7da; padding: 20px; border-radius: 5px; }
-                    </style>
-                </head>
-                <body>
-                    <div class="error">
-                        <h2>PDF Conversion Notice</h2>
-                        <p>No PDF conversion libraries are available on this system.</p>
-                        <p>Please install one of the following packages:</p>
-                        <ul style="text-align: left; display: inline-block;">
-                            <li>spire.pdf</li>
-                            <li>pdfminer.six</li>
-                            <li>PyPDF2</li>
-                        </ul>
-                    </div>
-                </body>
-                </html>
-                """
-                
-                # Write HTML to file
-                with open(html_path, 'w', encoding='utf-8') as html_file:
-                    html_file.write(html_content)
-        
-        # Read the generated HTML file
-        with open(html_path, 'r', encoding='utf-8') as html_file:
-            content = html_file.read()
-        
-        # Clean up the HTML file
-        try:
-            os.remove(html_path)
-        except Exception as e:
-            logger.warning(f"Could not remove temporary HTML file: {e}")
-        
-        return content
-        
-    except Exception as e:
-        logger.error(f"Error in fallback PDF conversion: {str(e)}")
-        
-        # Return an error message as HTML
-        error_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <style>
-                body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; }}
-                .error {{ color: #721c24; background-color: #f8d7da; padding: 20px; border-radius: 5px; }}
-            </style>
-        </head>
-        <body>
-            <div class="error">
-                <h2>PDF Conversion Error</h2>
-                <p>An error occurred while converting the PDF:</p>
-                <p>{str(e)}</p>
-            </div>
-        </body>
-        </html>
-        """
-        
-        return error_html
+    # GET method returns current configuration
+    return jsonify({
+        'max_workers': MAX_WORKERS,
+        'font_scale': FONT_SCALE_FACTOR,
+        'image_quality': IMAGE_QUALITY,
+        'text_spacing': ENABLE_TEXT_SPACING
+    })
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    port = int(os.environ.get('PORT', 8080))
+    debug = os.environ.get('FLASK_ENV') == 'development'
+    
+    # Log startup information
+    logger.info(f"Starting PDF to HTML conversion service on port {port}")
+    logger.info(f"Workers: {MAX_WORKERS}, Font scale: {FONT_SCALE_FACTOR}")
+    
+    app.run(host='0.0.0.0', port=port, debug=debug)
